@@ -60,6 +60,9 @@
 	  <None Update="PDFBOX-1869-4-1.pdf">
 	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
 	  </None>
+	  <None Update="GHOSTSCRIPT-697234-0.pdf">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
 	  <None Update="GHOSTSCRIPT-700236-1.pdf">
 	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
 	  </None>
