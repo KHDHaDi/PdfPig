@@ -1,5 +1,6 @@
 ﻿using System.IO;
 using System.IO.Compression;
+using System.Reflection;
 using BenchmarkDotNet.Attributes;
 using UglyToad.PdfPig.Filters;
 using UglyToad.PdfPig.Tokens;
@@ -27,47 +28,31 @@ public class FlateFilterBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var found = new List<(byte[], DictionaryToken)>();
-
-        foreach (var file in new[] { "Pig Production Handbook.pdf", "fseprd1102849.pdf", "MOZILLA-7375-0.pdf", "iron-ore-q2-q3-2013.pdf", "11194059_2017-11_de_s.pdf", "algo.pdf" })
-        {
-            using var document = PdfDocument.Open(file, new ParsingOptions { UseLenientParsing = true });
-
-            foreach (var reference in document.Structure.CrossReferenceTable.ObjectOffsets.Keys)
-            {
-                ObjectToken obj;
-                try
-                {
-                    obj = document.Structure.GetObject(reference);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (obj.Data is not StreamToken stream
-                    || !stream.StreamDictionary.TryGet(NameToken.Filter, out var token)
-                    || token is not NameToken name
-                    || name.Data != NameToken.FlateDecode.Data
-                    || stream.StreamDictionary.TryGet(NameToken.DecodeParms, out _)
-                    || stream.Data.Length < 3)
-                {
-                    continue;
-                }
-
-                found.Add((stream.Data.ToArray(), stream.StreamDictionary));
-            }
-        }
-
-        streams = found.ToArray();
+        streams = FlateStreams.Load();
         scratch = new byte[1 << 20];
 
         Console.WriteLine($"// {streams.Length} plain Flate streams, {streams.Sum(s => (long)s.Data.Length) / 1024} KB compressed, {streams.Sum(s => (long)filter.Decode(s.Data, s.Dictionary, DefaultFilterProvider.Instance, 0).Length) / 1024} KB decoded");
     }
 
-    /// <summary>The filter as it is.</summary>
+    /// <summary>The filter as it is: native zlib through DeflateStream.</summary>
     [Benchmark(Baseline = true)]
     public long Filter()
+    {
+        UseManagedInflater(false);
+
+        return RunFilter();
+    }
+
+    /// <summary>The filter with the managed inflater, where the build has one.</summary>
+    [Benchmark]
+    public long FilterManaged()
+    {
+        UseManagedInflater(true);
+
+        return RunFilter();
+    }
+
+    private long RunFilter()
     {
         long total = 0;
 
@@ -77,6 +62,12 @@ public class FlateFilterBenchmarks
         }
 
         return total;
+    }
+
+    /// <summary>Flips the filter's internal switch between the managed and the native inflater, when the build has it.</summary>
+    private static void UseManagedInflater(bool managed)
+    {
+        typeof(FlateFilter).GetField("UseManagedInflater", BindingFlags.NonPublic | BindingFlags.Static)?.SetValue(null, managed);
     }
 
     /// <summary>The bare inflater into a fixed scratch buffer that is never kept: the floor nothing can go below.</summary>

@@ -25,6 +25,9 @@ internal class Program
                 typeof(Type4FunctionBenchmarks),
                 typeof(PngPredictorBenchmarks),
                 typeof(FlateFilterBenchmarks),
+#if INCLUDE_NET11
+                typeof(OneShotDecoderBenchmarks),
+#endif
                 typeof(IccColorManagementBenchmarks),
             }).Run(args);
         }
@@ -36,4 +39,4 @@ internal class Program
             Console.ReadKey();
         }
     }
-}
+}

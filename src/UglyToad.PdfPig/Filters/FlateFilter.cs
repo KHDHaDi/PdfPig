@@ -4,6 +4,7 @@
     using System;
     using System.IO;
     using System.IO.Compression;
+    using Flate;
     using Tokens;
     using Core;
     using Util;
@@ -103,6 +104,19 @@
             return decoded;
         }
 
+        /// <summary>
+        /// Whether streams are inflated by the managed <see cref="Inflater"/> or by DeflateStream over
+        /// the runtime's native zlib. The managed one is faster on .NET 8 and much faster on .NET
+        /// Framework; from .NET 9 DeflateStream inflates through zlib-ng and wins, so the default
+        /// follows the runtime. Internal so that the benchmarks can compare the two.
+        /// </summary>
+        internal static bool UseManagedInflater =
+#if NET9_0_OR_GREATER
+            false;
+#else
+            true;
+#endif
+
         private static Memory<byte> Inflate(Memory<byte> input,
             int predictor,
             int colors,
@@ -112,6 +126,12 @@
             int blockLength,
             out bool damaged)
         {
+            if (UseManagedInflater)
+            {
+                damaged = false;
+                return InflateManaged(input, predictor, colors, bitsPerComponent, columns, streamDictionary);
+            }
+
             using var memoryStream = MemoryHelper.AsReadOnlyMemoryStream(input);
             // The first 2 bytes are the header which DeflateStream does not support.
             memoryStream.ReadByte();
@@ -296,6 +316,75 @@
                 output.AsSpan(0, decodedLength).CopyTo(exact);
 
                 return exact;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Inflates with the managed inflater, which takes the whole stream at once and keeps what it
+        /// decoded when the data is damaged or cut short, so there is no block loop and no second
+        /// pass to salvage. The predictor runs afterwards: while inflating, the output is the window
+        /// that matches copy from, and rows may only change once nothing copies from them any more.
+        /// </summary>
+        private static Memory<byte> InflateManaged(Memory<byte> input, int predictor, int colors, int bitsPerComponent, int columns, DictionaryToken streamDictionary)
+        {
+            // The first 2 bytes are the zlib header, which the inflater does not want.
+            var raw = input.Length >= 2 ? input.Span.Slice(2) : ReadOnlySpan<byte>.Empty;
+
+            var buffer = ArrayPool<byte>.Shared.Rent(
+                (int)Math.Min(MaximumCapacity, Math.Max(MinimumCapacity, (long)input.Length * InitialCapacityFactor)));
+
+            try
+            {
+                var length = Inflater.Inflate(raw, ref buffer, out _);
+
+                if (predictor <= 1)
+                {
+                    var plain = AllocateResult(length);
+                    buffer.AsSpan(0, length).CopyTo(plain);
+                    return plain;
+                }
+
+                if (TryGetImageHeight(streamDictionary, out var height))
+                {
+                    // Rows go straight into a result of the known size.
+                    var decoder = new PngPredictor.Decoder(predictor, colors, bitsPerComponent, columns);
+                    var output = AllocateResult((int)Math.Min(MaximumCapacity, (long)height * decoder.RowLength));
+
+                    EnsureOutput(ref output, decoder.Stride > 0 ? (length / decoder.Stride) * decoder.RowLength : 0);
+                    decoder.Advance(buffer, length, output);
+
+                    EnsureOutput(ref output, decoder.FinalLength(length));
+                    var decodedLength = decoder.Finish(buffer, length, output);
+
+                    if (decodedLength == output.Length)
+                    {
+                        return output;
+                    }
+
+                    var exact = AllocateResult(decodedLength);
+                    output.AsSpan(0, decodedLength).CopyTo(exact);
+                    return exact;
+                }
+
+                // Rows decoded where they lie and gathered by the copy into the result.
+                var inPlace = new PngPredictor.Decoder(predictor, colors, bitsPerComponent, columns, compact: false);
+                inPlace.Advance(buffer, length);
+
+                var required = inPlace.RequiredCapacity(length);
+                if (required > buffer.Length)
+                {
+                    Grow(ref buffer, length, required);
+                }
+
+                var rows = inPlace.Finish(buffer, length);
+                var decoded = AllocateResult(rows);
+                inPlace.CopyTo(buffer, decoded);
+
+                return decoded;
             }
             finally
             {

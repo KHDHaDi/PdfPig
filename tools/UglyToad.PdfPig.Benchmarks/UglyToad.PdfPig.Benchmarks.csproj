@@ -3,6 +3,9 @@
 	<PropertyGroup>
 		<OutputType>Exe</OutputType>
 		<TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+		<!-- .NET 11 needs its preview SDK; opt in with -p:IncludeNet11=true to add its runtime job and the one-shot decoder benchmarks. -->
+		<TargetFrameworks Condition="'$(IncludeNet11)' == 'true'">net8.0;net9.0;net11.0</TargetFrameworks>
+		<DefineConstants Condition="'$(IncludeNet11)' == 'true'">$(DefineConstants);INCLUDE_NET11</DefineConstants>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 
@@ -77,4 +80,4 @@
 	  </None>
 	</ItemGroup>
 
-</Project>
+</Project>
