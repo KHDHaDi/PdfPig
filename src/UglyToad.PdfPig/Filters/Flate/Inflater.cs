@@ -21,7 +21,14 @@
     /// and the outcome says what happened, which is what a filter reading damaged documents wants
     /// and what the stream classes cannot give without losing the last block.
     /// </para>
+    /// <para>
+    /// The hot loop works on pointers: pinned input, output and tables, so that no lookup and no
+    /// store pays a bounds check, and copies may spill past a match into slack that is kept free.
+    /// Locals are not zeroed on entry, which matters for the stack-allocated scratch of the table
+    /// builder; every buffer that needs clearing is cleared where it is declared.
+    /// </para>
     /// </remarks>
+    [SkipLocalsInit]
     internal static class Inflater
     {
         /// <summary>How an inflate ended.</summary>
@@ -387,109 +394,18 @@
 
             while (true)
             {
-                // The fast loop: while the input has whole words to load and the output has slack
-                // for the most one pass can write, nothing needs a check per symbol. A refill
-                // leaves at least 56 bits, enough for three literals of up to 15 bits, or for two
-                // literals and a length with its extra bits; a second refill precedes the distance.
-                // The literals decoded straight after one another follow libdeflate.
-                var preloaded = 0u;
-                var hasPreloaded = false;
-
-                while (reader.Remaining >= FastLoopInputBytes && output.Length - written >= OutputSlack)
+                // The fast loop, over pointers: while the input has whole words to load and the
+                // output has slack for the most one pass can write, nothing needs a check per
+                // symbol. It stops at the end of the block, at damage, or when input or room runs
+                // low, and the loop below then takes one careful symbol before trying again.
+                if (reader.Remaining >= FastLoopInputBytes && output.Length - written >= OutputSlack)
                 {
-                    reader.Refill();
+                    var fast = FastLoop(ref reader, output, ref written, literalLengthTable, literalLengthBits, distanceTable, distanceBits);
 
-                    var fastEntry = hasPreloaded ? preloaded : literalLengthTable[(int)(reader.Bits & literalLengthMask)];
-                    hasPreloaded = false;
-
-                    if ((fastEntry & LiteralFlag) != 0)
+                    if (fast != null)
                     {
-                        reader.Consume((int)(fastEntry & 0xFF));
-                        output[written++] = (byte)(fastEntry >> ValueShift);
-
-                        fastEntry = literalLengthTable[(int)(reader.Bits & literalLengthMask)];
-
-                        if ((fastEntry & LiteralFlag) != 0)
-                        {
-                            reader.Consume((int)(fastEntry & 0xFF));
-                            output[written++] = (byte)(fastEntry >> ValueShift);
-
-                            fastEntry = literalLengthTable[(int)(reader.Bits & literalLengthMask)];
-
-                            if ((fastEntry & LiteralFlag) != 0)
-                            {
-                                reader.Consume((int)(fastEntry & 0xFF));
-                                output[written++] = (byte)(fastEntry >> ValueShift);
-                                continue;
-                            }
-                        }
+                        return fast.Value;
                     }
-
-                    if ((fastEntry & SubtableFlag) != 0)
-                    {
-                        reader.Consume(literalLengthBits);
-                        fastEntry = literalLengthTable[(int)(fastEntry >> ValueShift) + (int)(reader.Bits & ((1u << ((int)(fastEntry >> CodeLengthShift) & 0xF)) - 1))];
-
-                        if ((fastEntry & LiteralFlag) != 0)
-                        {
-                            reader.Consume((int)(fastEntry & 0xFF));
-                            output[written++] = (byte)(fastEntry >> ValueShift);
-                            continue;
-                        }
-                    }
-
-                    var fastTotal = (int)(fastEntry & 0xFF);
-
-                    if (fastTotal == 0)
-                    {
-                        return Outcome.Damaged;
-                    }
-
-                    if ((fastEntry & EndOfBlockFlag) != 0)
-                    {
-                        reader.Consume(fastTotal);
-                        return Outcome.Complete;
-                    }
-
-                    var fastSaved = reader.Bits;
-                    reader.Consume(fastTotal);
-
-                    var fastLength = (int)(fastEntry >> ValueShift) + (int)((fastSaved & ((1UL << fastTotal) - 1)) >> ((int)(fastEntry >> CodeLengthShift) & 0xF));
-
-                    reader.Refill();
-
-                    fastEntry = distanceTable[(int)(reader.Bits & distanceMask)];
-
-                    if ((fastEntry & SubtableFlag) != 0)
-                    {
-                        reader.Consume(distanceBits);
-                        fastEntry = distanceTable[(int)(fastEntry >> ValueShift) + (int)(reader.Bits & ((1u << ((int)(fastEntry >> CodeLengthShift) & 0xF)) - 1))];
-                    }
-
-                    fastTotal = (int)(fastEntry & 0xFF);
-
-                    if (fastTotal == 0)
-                    {
-                        return Outcome.Damaged;
-                    }
-
-                    fastSaved = reader.Bits;
-                    reader.Consume(fastTotal);
-
-                    var fastDistance = (int)(fastEntry >> ValueShift) + (int)((fastSaved & ((1UL << fastTotal) - 1)) >> ((int)(fastEntry >> CodeLengthShift) & 0xF));
-
-                    if (fastDistance > written)
-                    {
-                        return Outcome.Damaged;
-                    }
-
-                    // The entry after the match is looked up before the copy so that its load
-                    // overlaps the copy; at least 28 bits are still buffered, enough for any code.
-                    preloaded = literalLengthTable[(int)(reader.Bits & literalLengthMask)];
-                    hasPreloaded = true;
-
-                    CopyMatch(output, written, fastDistance, fastLength);
-                    written += fastLength;
                 }
 
                 // Near the end of the input, or with the output nearly full: one symbol with every
@@ -582,6 +498,220 @@
                 CopyMatch(output, written, distance, length);
                 written += length;
             }
+        }
+
+        /// <summary>
+        /// Decodes symbols as fast as they come while the input has at least
+        /// <see cref="FastLoopInputBytes"/> left and the output at least <see cref="OutputSlack"/>,
+        /// so that nothing needs a check per symbol. Returns the outcome when the block ended or
+        /// turned out damaged, or null when input or room ran low and the caller has to go on
+        /// carefully.
+        /// </summary>
+        /// <remarks>
+        /// A refill leaves at least 56 bits: enough for three literals of up to 15 bits, or for
+        /// two literals and a length with its extra bits; a second refill precedes the distance.
+        /// After a match the entry the next pass starts with is looked up before the copy, so that
+        /// its load overlaps the copy. Pointers into the pinned input, output and tables spare the
+        /// bounds checks every lookup and store would otherwise pay. The shape follows libdeflate.
+        /// </remarks>
+        private static unsafe Outcome? FastLoop(ref BitReader reader, byte[] output, ref int written, uint[] literalLengthTable, int literalLengthBits, uint[] distanceTable, int distanceBits)
+        {
+            var literalLengthMask = (1u << literalLengthBits) - 1;
+            var distanceMask = (1u << distanceBits) - 1;
+
+            fixed (byte* inputBase = reader.Input)
+            fixed (byte* outputBase = output)
+            fixed (uint* literalLength = literalLengthTable)
+            fixed (uint* distances = distanceTable)
+            {
+                var input = inputBase + reader.Position;
+                var inputLast = inputBase + reader.Input.Length - FastLoopInputBytes;
+                var cursor = outputBase + written;
+                var outputLast = outputBase + output.Length - OutputSlack;
+                var bits = reader.Bits;
+                var count = reader.Count;
+
+                Outcome? result = null;
+                var preloaded = 0u;
+                var hasPreloaded = false;
+
+                while (input <= inputLast && cursor <= outputLast)
+                {
+                    // Refill: a whole word loaded, only the bytes that fit consumed.
+                    bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
+                    input += (63 - count) >> 3;
+                    count |= 56;
+
+                    var entry = hasPreloaded ? preloaded : literalLength[bits & literalLengthMask];
+                    hasPreloaded = false;
+
+                    if ((entry & LiteralFlag) != 0)
+                    {
+                        bits >>= (int)(entry & 0xFF);
+                        count -= (int)(entry & 0xFF);
+                        *cursor++ = (byte)(entry >> ValueShift);
+
+                        entry = literalLength[bits & literalLengthMask];
+
+                        if ((entry & LiteralFlag) != 0)
+                        {
+                            bits >>= (int)(entry & 0xFF);
+                            count -= (int)(entry & 0xFF);
+                            *cursor++ = (byte)(entry >> ValueShift);
+
+                            entry = literalLength[bits & literalLengthMask];
+
+                            if ((entry & LiteralFlag) != 0)
+                            {
+                                bits >>= (int)(entry & 0xFF);
+                                count -= (int)(entry & 0xFF);
+                                *cursor++ = (byte)(entry >> ValueShift);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if ((entry & SubtableFlag) != 0)
+                    {
+                        bits >>= literalLengthBits;
+                        count -= literalLengthBits;
+                        entry = literalLength[(entry >> ValueShift) + (bits & ((1u << (int)((entry >> CodeLengthShift) & 0xF)) - 1))];
+
+                        if ((entry & LiteralFlag) != 0)
+                        {
+                            bits >>= (int)(entry & 0xFF);
+                            count -= (int)(entry & 0xFF);
+                            *cursor++ = (byte)(entry >> ValueShift);
+                            continue;
+                        }
+                    }
+
+                    var total = (int)(entry & 0xFF);
+
+                    if (total == 0)
+                    {
+                        result = Outcome.Damaged;
+                        break;
+                    }
+
+                    if ((entry & EndOfBlockFlag) != 0)
+                    {
+                        bits >>= total;
+                        count -= total;
+                        result = Outcome.Complete;
+                        break;
+                    }
+
+                    var saved = bits;
+                    bits >>= total;
+                    count -= total;
+
+                    var length = (int)(entry >> ValueShift) + (int)((saved & ((1UL << total) - 1)) >> (int)((entry >> CodeLengthShift) & 0xF));
+
+                    bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
+                    input += (63 - count) >> 3;
+                    count |= 56;
+
+                    entry = distances[bits & distanceMask];
+
+                    if ((entry & SubtableFlag) != 0)
+                    {
+                        bits >>= distanceBits;
+                        count -= distanceBits;
+                        entry = distances[(entry >> ValueShift) + (bits & ((1u << (int)((entry >> CodeLengthShift) & 0xF)) - 1))];
+                    }
+
+                    total = (int)(entry & 0xFF);
+
+                    if (total == 0)
+                    {
+                        result = Outcome.Damaged;
+                        break;
+                    }
+
+                    saved = bits;
+                    bits >>= total;
+                    count -= total;
+
+                    var distance = (int)(entry >> ValueShift) + (int)((saved & ((1UL << total) - 1)) >> (int)((entry >> CodeLengthShift) & 0xF));
+
+                    if (distance > cursor - outputBase)
+                    {
+                        // Reaches back before the start of the output.
+                        result = Outcome.Damaged;
+                        break;
+                    }
+
+                    preloaded = literalLength[bits & literalLengthMask];
+                    hasPreloaded = true;
+
+                    Copy(cursor, cursor - distance, distance, length);
+                    cursor += length;
+                }
+
+                reader.Position = (int)(input - inputBase);
+                reader.Bits = bits;
+                reader.Count = count;
+                written = (int)(cursor - outputBase);
+
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// Copies a match of <paramref name="length"/> bytes from <paramref name="distance"/> bytes
+        /// back, a word at a time, spilling up to a word past the end into the slack. Source and
+        /// destination overlap when the distance is shorter than the length; with a distance of a
+        /// word or more each word read lies before the words written, with a shorter distance the
+        /// pattern is carried forward by the distance per word stored. As in libdeflate.
+        /// </summary>
+        private static unsafe void Copy(byte* destination, byte* source, int distance, int length)
+        {
+            var end = destination + length;
+
+            if (distance >= sizeof(ulong))
+            {
+                // Two words unconditionally, which covers most matches, then a word per step.
+                Unsafe.WriteUnaligned(destination, Unsafe.ReadUnaligned<ulong>(source));
+                Unsafe.WriteUnaligned(destination + sizeof(ulong), Unsafe.ReadUnaligned<ulong>(source + sizeof(ulong)));
+
+                if (length <= 2 * sizeof(ulong))
+                {
+                    return;
+                }
+
+                destination += 2 * sizeof(ulong);
+                source += 2 * sizeof(ulong);
+
+                do
+                {
+                    Unsafe.WriteUnaligned(destination, Unsafe.ReadUnaligned<ulong>(source));
+                    destination += sizeof(ulong);
+                    source += sizeof(ulong);
+                } while (destination < end);
+
+                return;
+            }
+
+            if (distance == 1)
+            {
+                var word = *source * 0x0101010101010101UL;
+
+                do
+                {
+                    Unsafe.WriteUnaligned(destination, word);
+                    destination += sizeof(ulong);
+                } while (destination < end);
+
+                return;
+            }
+
+            do
+            {
+                Unsafe.WriteUnaligned(destination, Unsafe.ReadUnaligned<ulong>(source));
+                destination += distance;
+                source += distance;
+            } while (destination < end);
         }
 
         /// <summary>
@@ -1020,10 +1150,20 @@
             }
 
             /// <summary>The buffered bits, the next one to read in the lowest position.</summary>
-            public ulong Bits { get; private set; }
+            public ulong Bits { get; set; }
 
             /// <summary>How many of <see cref="Bits"/> are valid.</summary>
-            public int Count { get; private set; }
+            public int Count { get; set; }
+
+            /// <summary>The whole input.</summary>
+            public ReadOnlySpan<byte> Input => input;
+
+            /// <summary>The next byte of the input to load into the buffer.</summary>
+            public int Position
+            {
+                get => position;
+                set => position = value;
+            }
 
             /// <summary>
             /// Tops the buffer up to at least 56 bits while input remains. A whole word is loaded

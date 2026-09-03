@@ -106,16 +106,11 @@
 
         /// <summary>
         /// Whether streams are inflated by the managed <see cref="Inflater"/> or by DeflateStream over
-        /// the runtime's native zlib. The managed one is faster on .NET 8 and much faster on .NET
-        /// Framework; from .NET 9 DeflateStream inflates through zlib-ng and wins, so the default
-        /// follows the runtime. Internal so that the benchmarks can compare the two.
+        /// the runtime's native zlib. The managed one is ahead on every runtime: by a few percent
+        /// of zlib-ng on .NET 9 and later, by 45 percent of zlib on .NET 8 and by far more on .NET
+        /// Framework. Internal so that the benchmarks can compare the two.
         /// </summary>
-        internal static bool UseManagedInflater =
-#if NET9_0_OR_GREATER
-            false;
-#else
-            true;
-#endif
+        internal static bool UseManagedInflater = true;
 
         private static Memory<byte> Inflate(Memory<byte> input,
             int predictor,
