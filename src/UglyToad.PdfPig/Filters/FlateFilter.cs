@@ -329,8 +329,8 @@
             // The first 2 bytes are the zlib header, which the inflater does not want.
             var raw = input.Length >= 2 ? input.Span.Slice(2) : ReadOnlySpan<byte>.Empty;
 
-            var buffer = ArrayPool<byte>.Shared.Rent(
-                (int)Math.Min(MaximumCapacity, Math.Max(MinimumCapacity, (long)input.Length * InitialCapacityFactor)));
+            var buffer = ArrayPool<byte>.Shared.Rent(EstimateCapacity(input.Length, streamDictionary));
+            var kept = false;
 
             try
             {
@@ -338,6 +338,14 @@
 
                 if (predictor <= 1)
                 {
+                    // A result that fills its buffer to within a quarter is the buffer itself, taken
+                    // out of the pool: copying it into an exact array would cost more than the slack.
+                    if (length > 0 && length >= buffer.Length - (buffer.Length >> 2))
+                    {
+                        kept = true;
+                        return new Memory<byte>(buffer, 0, length);
+                    }
+
                     var plain = AllocateResult(length);
                     buffer.AsSpan(0, length).CopyTo(plain);
                     return plain;
@@ -383,8 +391,47 @@
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                if (!kept)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
             }
+        }
+
+        /// <summary>
+        /// How large a buffer to inflate into: the decoded length when the dictionary states it, as
+        /// font programs do with Length1 and Length2 and some streams with DL, otherwise a multiple
+        /// of the compressed length. Room beyond the stated length keeps the inflater from growing
+        /// the buffer just before the end.
+        /// </summary>
+        private static int EstimateCapacity(int compressedLength, DictionaryToken streamDictionary)
+        {
+            long stated = 0;
+
+            if (streamDictionary.TryGet(NameToken.Dl, out var dl) && dl is NumericToken decodedLength && decodedLength.Int > 0)
+            {
+                stated = decodedLength.Int;
+            }
+            else
+            {
+                if (streamDictionary.TryGet(NameToken.Length1, out var token1) && token1 is NumericToken length1 && length1.Int > 0)
+                {
+                    stated = length1.Int;
+                }
+
+                if (streamDictionary.TryGet(NameToken.Length2, out var token2) && token2 is NumericToken length2 && length2.Int > 0)
+                {
+                    stated += length2.Int;
+                }
+            }
+
+            // Deflate expands by 1032 at the very most; a larger statement is not to be trusted.
+            if (stated > 0 && stated <= (long)compressedLength * 1032 + MinimumCapacity)
+            {
+                return (int)Math.Min(MaximumCapacity, stated + 1024);
+            }
+
+            return (int)Math.Min(MaximumCapacity, Math.Max(MinimumCapacity, (long)compressedLength * InitialCapacityFactor));
         }
 
         private static bool TryGetImageHeight(DictionaryToken streamDictionary, out int height)
@@ -481,4 +528,4 @@
             }
         }
     }
-}
+}
