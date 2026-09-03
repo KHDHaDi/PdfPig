@@ -49,7 +49,6 @@ namespace UglyToad.PdfPig.Filters
         private static Memory<byte> Decode(ReadOnlySpan<byte> input, bool isEarlyChange, int predictor, int colors, int bitsPerComponent, int columns)
         {
             using (var output = new MemoryStream((int)(input.Length * 1.5))) // A guess.
-            using (var result = PngPredictor.WrapPredictor(output, predictor, colors, bitsPerComponent, columns))
             {
                 var table = GetDefaultTable();
 
@@ -80,7 +79,7 @@ namespace UglyToad.PdfPig.Filters
 
                     if (table.TryGetValue(next, out var b))
                     {
-                        result.Write(b,0, b.Length);
+                        output.Write(b, 0, b.Length);
 
                         if (previous >= 0)
                         {
@@ -105,7 +104,7 @@ namespace UglyToad.PdfPig.Filters
 
                         newSequence[lastSequence.Length] = lastSequence[0];
 
-                        result.Write(newSequence, 0, newSequence.Length);
+                        output.Write(newSequence, 0, newSequence.Length);
                         
                         table[table.Count] = newSequence;
                     }
@@ -130,9 +129,7 @@ namespace UglyToad.PdfPig.Filters
                     }
                 }
 
-                result.Flush();
-
-                return output.AsMemory();
+                return PngPredictor.Decode(output.AsMemory(), predictor, colors, bitsPerComponent, columns);
             }
         }
 
