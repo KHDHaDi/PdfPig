@@ -61,7 +61,9 @@
             var scanner = new CoreTokenScanner(inputBytes, false, stackDepthGuard, useLenientParsing: useLenientParsing);
 
             var precedingTokens = new List<IToken>();
-            var graphicsStateOperations = new List<IGraphicsStateOperation>();
+            // About one operation per 20 bytes of content; sized up front so that a long stream does
+            // not leave a trail of ever larger discarded arrays behind while the list grows.
+            var graphicsStateOperations = new List<IGraphicsStateOperation>((int)Math.Min(inputBytes.Length / 16, 1 << 20));
 
             var lastEndImageOffset = new long?();
 

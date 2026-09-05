@@ -59,6 +59,26 @@
             return memory.Span[currentOffset + 1];
         }
 
+        /// <summary>
+        /// The whole input, for tokenizers that find the end of a token in place rather than
+        /// through <see cref="MoveNext"/> one byte at a time.
+        /// </summary>
+        internal ReadOnlySpan<byte> Span => memory.Span;
+
+        /// <summary>
+        /// The index of <see cref="CurrentByte"/> in <see cref="Span"/>, -1 before the first read.
+        /// </summary>
+        internal int Position => currentOffset;
+
+        /// <summary>
+        /// Moves onto the byte at <paramref name="index"/>, as a sequence of <see cref="MoveNext"/> calls would.
+        /// </summary>
+        internal void MoveTo(int index)
+        {
+            currentOffset = index;
+            CurrentByte = memory.Span[index];
+        }
+
         /// <inheritdoc />
         public bool IsAtEnd()
         {
