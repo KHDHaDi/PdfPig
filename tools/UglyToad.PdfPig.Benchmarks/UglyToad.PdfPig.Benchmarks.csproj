@@ -12,6 +12,21 @@
 		<PdfPigVersion Condition="'$(PdfPigVersion)' == ''">Local</PdfPigVersion>
 	</PropertyGroup>
 
+	<!--
+	The flate-ab command compares the inflater with a snapshot of an earlier version, both compiled
+	into this assembly: opt in with -p:FlateAb=true after making the snapshot, see FlateAb.cs.
+	-->
+	<PropertyGroup Condition="'$(FlateAb)' == 'true'">
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<DefineConstants>$(DefineConstants);FLATE_AB</DefineConstants>
+	</PropertyGroup>
+	<ItemGroup Condition="'$(FlateAb)' == 'true'">
+		<Compile Include="..\..\src\UglyToad.PdfPig\Filters\Flate\Inflater.cs" Link="Inflater.cs" />
+	</ItemGroup>
+	<ItemGroup Condition="'$(FlateAb)' != 'true'">
+		<Compile Remove="FlateAb.cs;InflaterBaseline.cs" />
+	</ItemGroup>
+
 	<ItemGroup>
 		<PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
 	</ItemGroup>

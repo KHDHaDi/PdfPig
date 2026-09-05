@@ -6,6 +6,28 @@ internal class Program
 {
     static void Main(string[] args)
     {
+        // Two commands that are not benchmarks: a profile of the Flate filter by stream size, and
+        // a check of the managed inflater against DeflateStream over a folder of documents.
+        if (args.Length > 0 && args[0] == "flate-profile")
+        {
+            FlateProfile.Run(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "flate-verify")
+        {
+            FlateVerify.Run(args);
+            return;
+        }
+
+#if FLATE_AB
+        if (args.Length > 0 && args[0] == "flate-ab")
+        {
+            FlateAb.Run(args);
+            return;
+        }
+#endif
+
         // Pass class names on the command line to pick benchmarks, e.g.:
         //     dotnet run -c Release -- --filter *ShadingAndColorBenchmarks*
         // When no args are supplied default to the shading/colour suite that the

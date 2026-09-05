@@ -106,9 +106,10 @@
 
         /// <summary>
         /// Whether streams are inflated by the managed <see cref="Inflater"/> or by DeflateStream over
-        /// the runtime's native zlib. The managed one is ahead on every runtime: by a few percent
-        /// of zlib-ng on .NET 9 and later, by 45 percent of zlib on .NET 8 and by far more on .NET
-        /// Framework. Internal so that the benchmarks can compare the two.
+        /// the runtime's native zlib. The managed one is ahead on every runtime: over the Flate
+        /// streams of the benchmark documents it takes 22 ms where zlib-ng takes 25 on .NET 9 and
+        /// zlib 43 on .NET 8, and it is further ahead still on .NET Framework. Internal so that the
+        /// benchmarks can compare the two.
         /// </summary>
         internal static bool UseManagedInflater = true;
 
@@ -343,11 +344,26 @@
                     if (length > 0 && length >= buffer.Length - (buffer.Length >> 2))
                     {
                         kept = true;
+
+                        if (Inflater.Profile.Enabled)
+                        {
+                            Inflater.Profile.ResultsKept++;
+                        }
+
                         return new Memory<byte>(buffer, 0, length);
                     }
 
+                    var started = Inflater.Profile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
                     var plain = AllocateResult(length);
                     buffer.AsSpan(0, length).CopyTo(plain);
+
+                    if (Inflater.Profile.Enabled)
+                    {
+                        Inflater.Profile.ResultsCopied++;
+                        Inflater.Profile.ResultCopyTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
+                    }
+
                     return plain;
                 }
 

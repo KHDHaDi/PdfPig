@@ -3,7 +3,11 @@
     using System;
     using System.Buffers;
     using System.Buffers.Binary;
+    using System.Diagnostics;
     using System.Runtime.CompilerServices;
+#if NET
+    using System.Runtime.Intrinsics;
+#endif
 
     /// <summary>
     /// Inflates a raw deflate stream (RFC 1951) that lies complete in memory into a buffer that
@@ -14,7 +18,9 @@
     /// Built for how PDF uses deflate: every stream is in memory in one piece, so there is no
     /// streaming state to keep between calls, no separate window to maintain and no copy from a
     /// window into the output. Bits are read from a 64-bit buffer refilled eight bytes at a time,
-    /// codes are looked up in two-level tables, and matches are copies within the output.
+    /// codes are looked up in two-level tables built from ready-made entries per symbol, and
+    /// matches are copies within the output, a vector at a time. The output buffer grows to where
+    /// the stream is projected to end rather than by doubling.
     /// </para>
     /// <para>
     /// Damaged or cut short input is not an error: everything decoded up to that point is kept
@@ -44,6 +50,46 @@
             Damaged
         }
 
+        /// <summary>
+        /// Counters for the benchmarks' profile of the inflater: how many blocks of each kind were
+        /// met, and how long building the tables and decoding took, in <see cref="Stopwatch"/>
+        /// ticks. Off unless the benchmarks switch them on, which costs one static read per block.
+        /// </summary>
+        internal static class Profile
+        {
+            public static bool Enabled;
+            public static long DynamicBlocks;
+            public static long FixedBlocks;
+            public static long StoredBlocks;
+            public static long TableTicks;
+            public static long DecodeTicks;
+            public static long StoredTicks;
+
+            /// <summary>How often the output buffer had to grow, and the time the copies took; counted within the decode time.</summary>
+            public static long Grows;
+            public static long GrowTicks;
+
+            /// <summary>How many results the filter copied into an exact array, how many it kept in the inflate buffer, and the time the copies took.</summary>
+            public static long ResultsCopied;
+            public static long ResultsKept;
+            public static long ResultCopyTicks;
+
+            public static void Reset()
+            {
+                DynamicBlocks = 0;
+                FixedBlocks = 0;
+                StoredBlocks = 0;
+                TableTicks = 0;
+                DecodeTicks = 0;
+                StoredTicks = 0;
+                Grows = 0;
+                GrowTicks = 0;
+                ResultsCopied = 0;
+                ResultsKept = 0;
+                ResultCopyTicks = 0;
+            }
+        }
+
         /// <summary>The longest match a length code can stand for.</summary>
         private const int MaxMatchLength = 258;
 
@@ -59,7 +105,15 @@
         /// </summary>
         private const int FastLoopInputBytes = 16;
 
-        private const int LiteralLengthMainBits = 10;
+        /// <summary>
+        /// The main table of a literal/length code is as wide as this, or as its longest code when
+        /// that is shorter. Wider means fewer codes go through a subtable, whose second lookup and
+        /// unpredictable branch cost more than the larger table does to build: 11 bits measured 2
+        /// to 5 percent ahead of 10 on streams of every size, and 12 gained nothing more. Three
+        /// lookups and the preload of a fourth have to fit the 56 bits a refill guarantees.
+        /// </summary>
+        private const int LiteralLengthMainBits = 11;
+
         private const int DistanceMainBits = 8;
         private const int PrecodeMainBits = 7;
 
@@ -74,20 +128,18 @@
         // one shift: bits 0-7 hold the number of bits the codeword and its extra bits take together,
         // bits 8-11 the codeword's length alone, to shift the codeword off the extra bits, bits
         // 12-15 what kind of entry it is, and bits 16-31 the literal, the base length or distance,
-        // the precode symbol, or the offset of a subtable. An entry of zero is no code. The layout
-        // follows libdeflate.
+        // the precode symbol, or the offset of a subtable. An invalid entry is one that is not a
+        // code: a symbol the format defines no meaning for, or an index that no codeword of a
+        // single-codeword code reaches. The layout follows libdeflate.
         private const uint LiteralFlag = 0x1000;
         private const uint EndOfBlockFlag = 0x2000;
         private const uint SubtableFlag = 0x4000;
+        private const uint InvalidFlag = 0x8000;
         private const int CodeLengthShift = 8;
         private const int ValueShift = 16;
 
-        private enum TableKind
-        {
-            Precode,
-            LiteralLength,
-            Distance
-        }
+        /// <summary>Adds a codeword length to an entry: to the total in bits 0-7 and to bits 8-11 at once.</summary>
+        private const uint CodeLengthUnit = 1 | (1 << CodeLengthShift);
 
         /// <summary>
         /// The most entries the subtables of one table can take: zlib's enough program gives 308 for
@@ -123,17 +175,77 @@
             16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
         ];
 
+        /// <summary>
+        /// The entry of each symbol before its codeword length is known: flags, value and extra
+        /// bits. Building a table adds the length to the entry of each symbol and decides nothing
+        /// else per symbol. Symbols 286 and 287 of the literal/length code and 30 and 31 of the
+        /// distance code may be given codes but stand for nothing; their entries are invalid. As
+        /// in libdeflate.
+        /// </summary>
+        private static readonly uint[] LiteralLengthResults = BuildLiteralLengthResults();
+        private static readonly uint[] DistanceResults = BuildDistanceResults();
+        private static readonly uint[] PrecodeResults = BuildPrecodeResults();
+
         private static readonly int FixedLiteralLengthBits;
         private static readonly int FixedDistanceBits;
         private static readonly uint[] FixedLiteralLengthTable = BuildFixedLiteralLengthTable(out FixedLiteralLengthBits);
         private static readonly uint[] FixedDistanceTable = BuildFixedDistanceTable(out FixedDistanceBits);
 
+        private static uint[] BuildLiteralLengthResults()
+        {
+            var results = new uint[LiteralLengthSymbols];
+
+            for (var symbol = 0; symbol < EndOfBlock; symbol++)
+            {
+                results[symbol] = LiteralFlag | ((uint)symbol << ValueShift);
+            }
+
+            results[EndOfBlock] = EndOfBlockFlag;
+
+            for (var symbol = FirstLengthSymbol; symbol < LiteralLengthSymbols; symbol++)
+            {
+                var index = symbol - FirstLengthSymbol;
+
+                results[symbol] = index < LengthBase.Length
+                    ? ((uint)LengthBase[index] << ValueShift) | LengthExtraBits[index]
+                    : InvalidFlag;
+            }
+
+            return results;
+        }
+
+        private static uint[] BuildDistanceResults()
+        {
+            var results = new uint[DistanceSymbols];
+
+            for (var symbol = 0; symbol < DistanceSymbols; symbol++)
+            {
+                results[symbol] = symbol < DistanceBase.Length
+                    ? ((uint)DistanceBase[symbol] << ValueShift) | DistanceExtraBits[symbol]
+                    : InvalidFlag;
+            }
+
+            return results;
+        }
+
+        private static uint[] BuildPrecodeResults()
+        {
+            var results = new uint[PrecodeSymbols];
+
+            for (var symbol = 0; symbol < PrecodeSymbols; symbol++)
+            {
+                results[symbol] = (uint)symbol << ValueShift;
+            }
+
+            return results;
+        }
+
         /// <summary>
-        /// Inflates <paramref name="input"/> into <paramref name="output"/>, which is taken from and
-        /// grown through <see cref="ArrayPool{T}.Shared"/>, and returns the number of bytes written.
+        /// Inflates <paramref name="input"/> into <paramref name="output"/> and returns the number of
+        /// bytes written.
         /// </summary>
         /// <param name="input">The raw deflate data, without any zlib header.</param>
-        /// <param name="output">A rented buffer to write to; replaced by a larger rented buffer when it fills.</param>
+        /// <param name="output">A buffer from <see cref="ArrayPool{T}.Shared"/> to write to; replaced by a larger one from the pool when it fills.</param>
         /// <param name="outcome">Whether the stream ended properly, ran out, or turned out damaged.</param>
         public static int Inflate(ReadOnlySpan<byte> input, ref byte[] output, out Outcome outcome)
         {
@@ -162,14 +274,30 @@
                     reader.Consume(2);
 
                     Outcome blockOutcome;
+                    var profiling = Profile.Enabled;
+                    var started = profiling ? Stopwatch.GetTimestamp() : 0;
 
                     switch (blockType)
                     {
                         case 0:
                             blockOutcome = CopyStoredBlock(ref reader, ref output, ref written);
+
+                            if (profiling)
+                            {
+                                Profile.StoredBlocks++;
+                                Profile.StoredTicks += Stopwatch.GetTimestamp() - started;
+                            }
+
                             break;
                         case 1:
                             blockOutcome = DecodeBlock(ref reader, ref output, ref written, FixedLiteralLengthTable, FixedLiteralLengthBits, FixedDistanceTable, FixedDistanceBits);
+
+                            if (profiling)
+                            {
+                                Profile.FixedBlocks++;
+                                Profile.DecodeTicks += Stopwatch.GetTimestamp() - started;
+                            }
+
                             break;
                         case 2:
                             literalLengthTable ??= ArrayPool<uint>.Shared.Rent((1 << LiteralLengthMainBits) + MaxSubtableEntries);
@@ -178,9 +306,22 @@
 
                             blockOutcome = ReadDynamicTables(ref reader, ref literalLengthTable, out var literalLengthBits, ref distanceTable, out var distanceBits, ref precodeTable);
 
+                            if (profiling)
+                            {
+                                var built = Stopwatch.GetTimestamp();
+                                Profile.DynamicBlocks++;
+                                Profile.TableTicks += built - started;
+                                started = built;
+                            }
+
                             if (blockOutcome == Outcome.Complete)
                             {
                                 blockOutcome = DecodeBlock(ref reader, ref output, ref written, literalLengthTable, literalLengthBits, distanceTable, distanceBits);
+                            }
+
+                            if (profiling)
+                            {
+                                Profile.DecodeTicks += Stopwatch.GetTimestamp() - started;
                             }
 
                             break;
@@ -241,7 +382,7 @@
                 return Outcome.Damaged;
             }
 
-            EnsureCapacity(ref output, written, length);
+            EnsureCapacity(ref output, written, length, in reader);
 
             var copied = reader.CopyInput(output.AsSpan(written, length));
             written += copied;
@@ -292,7 +433,7 @@
 
             var precodeBits = PrecodeMainBits;
 
-            if (!BuildTable(TableKind.Precode, precodeLengths, ref precodeBits, ref precodeTable, allowSingleCode: false))
+            if (!BuildTable(PrecodeResults, precodeLengths, ref precodeBits, ref precodeTable, allowSingleCode: false))
             {
                 return Outcome.Damaged;
             }
@@ -377,8 +518,8 @@
                 return Outcome.Damaged;
             }
 
-            if (!BuildTable(TableKind.LiteralLength, codeLengths.Slice(0, literalLengthCount), ref literalLengthBits, ref literalLengthTable)
-                || !BuildTable(TableKind.Distance, codeLengths.Slice(literalLengthCount, distanceCount), ref distanceBits, ref distanceTable))
+            if (!BuildTable(LiteralLengthResults, codeLengths.Slice(0, literalLengthCount), ref literalLengthBits, ref literalLengthTable, allowSingleCode: true)
+                || !BuildTable(DistanceResults, codeLengths.Slice(literalLengthCount, distanceCount), ref distanceBits, ref distanceTable, allowSingleCode: true))
             {
                 return Outcome.Damaged;
             }
@@ -414,7 +555,7 @@
 
                 if (output.Length - written < OutputSlack)
                 {
-                    EnsureCapacity(ref output, written, OutputSlack);
+                    EnsureCapacity(ref output, written, OutputSlack, in reader);
                 }
 
                 var entry = literalLengthTable[(int)(reader.Bits & literalLengthMask)];
@@ -432,7 +573,7 @@
 
                 var total = (int)(entry & 0xFF);
 
-                if (total == 0)
+                if ((entry & InvalidFlag) != 0)
                 {
                     return Outcome.Damaged;
                 }
@@ -474,7 +615,7 @@
 
                 total = (int)(entry & 0xFF);
 
-                if (total == 0)
+                if ((entry & InvalidFlag) != 0)
                 {
                     return Outcome.Damaged;
                 }
@@ -509,10 +650,12 @@
         /// </summary>
         /// <remarks>
         /// A refill leaves at least 56 bits: enough for three literals of up to 15 bits, or for
-        /// two literals and a length with its extra bits; a second refill precedes the distance.
-        /// After a match the entry the next pass starts with is looked up before the copy, so that
-        /// its load overlaps the copy. Pointers into the pinned input, output and tables spare the
-        /// bounds checks every lookup and store would otherwise pay. The shape follows libdeflate.
+        /// two literals and a length with its extra bits, and for the lookup of the entry the next
+        /// pass starts with, which every path does last; a second refill precedes the distance.
+        /// That the next entry is always looked up before the pass comes round lets its load
+        /// overlap the refill, and after a match the copy, without a flag to say whether it was.
+        /// Pointers into the pinned input, output and tables spare the bounds checks every lookup
+        /// and store would otherwise pay. The shape follows libdeflate.
         /// </remarks>
         private static unsafe Outcome? FastLoop(ref BitReader reader, byte[] output, ref int written, uint[] literalLengthTable, int literalLengthBits, uint[] distanceTable, int distanceBits)
         {
@@ -532,18 +675,22 @@
                 var count = reader.Count;
 
                 Outcome? result = null;
-                var preloaded = 0u;
-                var hasPreloaded = false;
+
+                // The entry of the symbol at hand is always looked up before the loop comes round,
+                // from bits a refill has made sure of, so that its load overlaps the refill for what
+                // follows, and after a match the copy. Refill: a whole word loaded, only the bytes
+                // that fit consumed.
+                bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
+                input += (63 - count) >> 3;
+                count |= 56;
+
+                var entry = literalLength[bits & literalLengthMask];
 
                 while (input <= inputLast && cursor <= outputLast)
                 {
-                    // Refill: a whole word loaded, only the bytes that fit consumed.
                     bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
                     input += (63 - count) >> 3;
                     count |= 56;
-
-                    var entry = hasPreloaded ? preloaded : literalLength[bits & literalLengthMask];
-                    hasPreloaded = false;
 
                     if ((entry & LiteralFlag) != 0)
                     {
@@ -566,6 +713,8 @@
                                 bits >>= (int)(entry & 0xFF);
                                 count -= (int)(entry & 0xFF);
                                 *cursor++ = (byte)(entry >> ValueShift);
+
+                                entry = literalLength[bits & literalLengthMask];
                                 continue;
                             }
                         }
@@ -582,20 +731,22 @@
                             bits >>= (int)(entry & 0xFF);
                             count -= (int)(entry & 0xFF);
                             *cursor++ = (byte)(entry >> ValueShift);
+
+                            entry = literalLength[bits & literalLengthMask];
                             continue;
                         }
                     }
 
                     var total = (int)(entry & 0xFF);
 
-                    if (total == 0)
+                    if ((entry & (EndOfBlockFlag | InvalidFlag)) != 0)
                     {
-                        result = Outcome.Damaged;
-                        break;
-                    }
+                        if ((entry & InvalidFlag) != 0)
+                        {
+                            result = Outcome.Damaged;
+                            break;
+                        }
 
-                    if ((entry & EndOfBlockFlag) != 0)
-                    {
                         bits >>= total;
                         count -= total;
                         result = Outcome.Complete;
@@ -623,7 +774,7 @@
 
                     total = (int)(entry & 0xFF);
 
-                    if (total == 0)
+                    if ((entry & InvalidFlag) != 0)
                     {
                         result = Outcome.Damaged;
                         break;
@@ -642,8 +793,7 @@
                         break;
                     }
 
-                    preloaded = literalLength[bits & literalLengthMask];
-                    hasPreloaded = true;
+                    entry = literalLength[bits & literalLengthMask];
 
                     Copy(cursor, cursor - distance, distance, length);
                     cursor += length;
@@ -668,6 +818,33 @@
         private static unsafe void Copy(byte* destination, byte* source, int distance, int length)
         {
             var end = destination + length;
+
+#if NET
+            if (distance >= Vector128<byte>.Count)
+            {
+                // Two vectors unconditionally, which covers most matches, then a vector per step;
+                // with the distance at least a vector, each vector read lies before those written.
+                Unsafe.WriteUnaligned(destination, Unsafe.ReadUnaligned<Vector128<byte>>(source));
+                Unsafe.WriteUnaligned(destination + Vector128<byte>.Count, Unsafe.ReadUnaligned<Vector128<byte>>(source + Vector128<byte>.Count));
+
+                if (length <= 2 * Vector128<byte>.Count)
+                {
+                    return;
+                }
+
+                destination += 2 * Vector128<byte>.Count;
+                source += 2 * Vector128<byte>.Count;
+
+                do
+                {
+                    Unsafe.WriteUnaligned(destination, Unsafe.ReadUnaligned<Vector128<byte>>(source));
+                    destination += Vector128<byte>.Count;
+                    source += Vector128<byte>.Count;
+                } while (destination < end);
+
+                return;
+            }
+#endif
 
             if (distance >= sizeof(ulong))
             {
@@ -695,6 +872,15 @@
 
             if (distance == 1)
             {
+#if NET
+                var vector = Vector128.Create(*source);
+
+                do
+                {
+                    Unsafe.WriteUnaligned(destination, vector);
+                    destination += Vector128<byte>.Count;
+                } while (destination < end);
+#else
                 var word = *source * 0x0101010101010101UL;
 
                 do
@@ -702,6 +888,7 @@
                     Unsafe.WriteUnaligned(destination, word);
                     destination += sizeof(ulong);
                 } while (destination < end);
+#endif
 
                 return;
             }
@@ -808,43 +995,9 @@
         }
 
         /// <summary>The table entry for <paramref name="symbol"/> with a code of <paramref name="codeLength"/> bits; see the entry layout at the flags.</summary>
-        private static uint MakeEntry(TableKind kind, int symbol, int codeLength)
+        private static uint MakeEntry(uint[] results, int symbol, int codeLength)
         {
-            var lengthBits = (uint)codeLength << CodeLengthShift;
-
-            switch (kind)
-            {
-                case TableKind.LiteralLength:
-                    if (symbol < EndOfBlock)
-                    {
-                        return LiteralFlag | ((uint)symbol << ValueShift) | lengthBits | (uint)codeLength;
-                    }
-
-                    if (symbol == EndOfBlock)
-                    {
-                        return EndOfBlockFlag | lengthBits | (uint)codeLength;
-                    }
-
-                    var lengthIndex = symbol - FirstLengthSymbol;
-
-                    if (lengthIndex >= LengthBase.Length)
-                    {
-                        // 286 and 287 can be given codes but stand for nothing.
-                        return 0;
-                    }
-
-                    return ((uint)LengthBase[lengthIndex] << ValueShift) | lengthBits | (uint)(codeLength + LengthExtraBits[lengthIndex]);
-                case TableKind.Distance:
-                    if (symbol >= DistanceBase.Length)
-                    {
-                        // 30 and 31 likewise.
-                        return 0;
-                    }
-
-                    return ((uint)DistanceBase[symbol] << ValueShift) | lengthBits | (uint)(codeLength + DistanceExtraBits[symbol]);
-                default:
-                    return ((uint)symbol << ValueShift) | lengthBits | (uint)codeLength;
-            }
+            return results[symbol] + (uint)codeLength * CodeLengthUnit;
         }
 
         /// <summary>
@@ -853,7 +1006,12 @@
         /// length or point at a subtable for the codes longer than that. Returns false when the code
         /// lengths do not form a usable code.
         /// </summary>
-        private static bool BuildTable(TableKind kind, ReadOnlySpan<byte> codeLengths, ref int mainBits, ref uint[] table, bool allowSingleCode = true)
+        /// <param name="results">The entry of each symbol before its codeword length, see <see cref="LiteralLengthResults"/>.</param>
+        /// <param name="codeLengths">The codeword length of each symbol, zero for a symbol without a code.</param>
+        /// <param name="mainBits">The width wanted for the main table; on return, the width built.</param>
+        /// <param name="table">A rented table, replaced by a larger one when it is too small.</param>
+        /// <param name="allowSingleCode">Whether a code of a single one-bit codeword passes, as a distance code with one distance legitimately is.</param>
+        private static bool BuildTable(uint[] results, ReadOnlySpan<byte> codeLengths, ref int mainBits, ref uint[] table, bool allowSingleCode)
         {
             Span<int> countByLength = stackalloc int[MaxCodeLength + 1];
             countByLength.Clear();
@@ -885,8 +1043,8 @@
                 // No codes at all, which a distance code may have when a block contains no
                 // matches: any distance code read is then invalid.
                 mainBits = 1;
-                table[0] = 0;
-                table[1] = 0;
+                table[0] = InvalidFlag;
+                table[1] = InvalidFlag;
                 return true;
             }
 
@@ -941,8 +1099,8 @@
             {
                 // The single one-bit code: its codeword is 0, and 1 is not a code.
                 mainBits = 1;
-                table[0] = MakeEntry(kind, sortedSymbols[0], 1);
-                table[1] = 0;
+                table[0] = MakeEntry(results, sortedSymbols[0], 1);
+                table[1] = InvalidFlag;
                 return true;
             }
 
@@ -982,7 +1140,7 @@
             {
                 do
                 {
-                    table[codeword] = MakeEntry(kind, sortedSymbols[next++], codeLength);
+                    table[codeword] = MakeEntry(results, sortedSymbols[next++], codeLength);
 
                     if (codeword == filled - 1)
                     {
@@ -1039,7 +1197,7 @@
                 }
 
                 var remainingLength = codeLength - mainBits;
-                var entry = MakeEntry(kind, sortedSymbols[next++], remainingLength);
+                var entry = MakeEntry(results, sortedSymbols[next++], remainingLength);
                 var stride = 1 << remainingLength;
 
                 for (var i = subtableStart + (codeword >> mainBits); i < subtableEnd; i += stride)
@@ -1099,7 +1257,7 @@
 
             var table = new uint[(1 << LiteralLengthMainBits) + MaxSubtableEntries];
             mainBits = LiteralLengthMainBits;
-            BuildTable(TableKind.LiteralLength, lengths, ref mainBits, ref table);
+            BuildTable(LiteralLengthResults, lengths, ref mainBits, ref table, allowSingleCode: true);
 
             return table;
         }
@@ -1111,25 +1269,49 @@
 
             var table = new uint[(1 << DistanceMainBits) + MaxSubtableEntries];
             mainBits = DistanceMainBits;
-            BuildTable(TableKind.Distance, lengths, ref mainBits, ref table);
+            BuildTable(DistanceResults, lengths, ref mainBits, ref table, allowSingleCode: true);
 
             return table;
         }
 
-        /// <summary>Makes room for <paramref name="required"/> more bytes after <paramref name="written"/>.</summary>
-        private static void EnsureCapacity(ref byte[] output, int written, int required)
+        /// <summary>
+        /// Makes room for <paramref name="required"/> more bytes after <paramref name="written"/>.
+        /// The buffer grows to where the stream is expected to end: what has come out so far, scaled
+        /// by how much of the input is still to come, plus an eighth for luck. Streams are alike from
+        /// start to end closely enough that one growth usually is the last, where doubling copied
+        /// the output over and over on streams that inflate twentyfold. Never less than half again,
+        /// so that a projection that falls short cannot cause a run of small growths. The new buffer
+        /// is the pool's: an exact array in its place, kept as the result without the copy, was
+        /// measured slower, since fresh memory costs more to write to than a recycled buffer.
+        /// </summary>
+        private static void EnsureCapacity(ref byte[] output, int written, int required, in BitReader reader)
         {
             if (output.Length - written >= required)
             {
                 return;
             }
 
-            var grown = ArrayPool<byte>.Shared.Rent((int)Math.Min(MaximumCapacity, Math.Max((long)written + required, output.Length * 2L)));
+            var started = Profile.Enabled ? Stopwatch.GetTimestamp() : 0;
+
+            var consumed = Math.Max(1, reader.Position - (reader.Count >> 3));
+            var projected = (long)written * reader.Input.Length / consumed;
+            projected += projected >> 3;
+
+            var wanted = Math.Max(projected, output.Length + (output.Length >> 1));
+            wanted = Math.Max(wanted, (long)written + required) + OutputSlack;
+
+            var grown = ArrayPool<byte>.Shared.Rent((int)Math.Min(MaximumCapacity, wanted));
 
             output.AsSpan(0, written).CopyTo(grown);
             ArrayPool<byte>.Shared.Return(output);
 
             output = grown;
+
+            if (Profile.Enabled)
+            {
+                Profile.Grows++;
+                Profile.GrowTicks += Stopwatch.GetTimestamp() - started;
+            }
         }
 
         /// <summary>
