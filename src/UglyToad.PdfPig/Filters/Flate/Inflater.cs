@@ -7,6 +7,7 @@
     using System.Runtime.CompilerServices;
 #if NET
     using System.Runtime.Intrinsics;
+    using System.Runtime.Intrinsics.X86;
 #endif
 
     /// <summary>
@@ -672,6 +673,12 @@
                 var cursor = outputBase + written;
                 var outputLast = outputBase + output.Length - OutputSlack;
                 var bits = reader.Bits;
+
+                // Only the low byte of the count is kept true. An entry is consumed by shifting the
+                // bits by it and subtracting it from the count whole, without masking its length
+                // out first: a shift reads six bits of its count and no more, and the value the
+                // entry carries above lands in bits of the count that nothing reads, as long as
+                // every use of the count takes its low byte. As in libdeflate.
                 var count = reader.Count;
 
                 Outcome? result = null;
@@ -681,7 +688,7 @@
                 // follows, and after a match the copy. Refill: a whole word loaded, only the bytes
                 // that fit consumed.
                 bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
-                input += (63 - count) >> 3;
+                input += (63 - (byte)count) >> 3;
                 count |= 56;
 
                 var entry = literalLength[bits & literalLengthMask];
@@ -689,29 +696,29 @@
                 while (input <= inputLast && cursor <= outputLast)
                 {
                     bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
-                    input += (63 - count) >> 3;
+                    input += (63 - (byte)count) >> 3;
                     count |= 56;
 
                     if ((entry & LiteralFlag) != 0)
                     {
-                        bits >>= (int)(entry & 0xFF);
-                        count -= (int)(entry & 0xFF);
+                        bits >>= (int)entry;
+                        count -= (int)entry;
                         *cursor++ = (byte)(entry >> ValueShift);
 
                         entry = literalLength[bits & literalLengthMask];
 
                         if ((entry & LiteralFlag) != 0)
                         {
-                            bits >>= (int)(entry & 0xFF);
-                            count -= (int)(entry & 0xFF);
+                            bits >>= (int)entry;
+                            count -= (int)entry;
                             *cursor++ = (byte)(entry >> ValueShift);
 
                             entry = literalLength[bits & literalLengthMask];
 
                             if ((entry & LiteralFlag) != 0)
                             {
-                                bits >>= (int)(entry & 0xFF);
-                                count -= (int)(entry & 0xFF);
+                                bits >>= (int)entry;
+                                count -= (int)entry;
                                 *cursor++ = (byte)(entry >> ValueShift);
 
                                 entry = literalLength[bits & literalLengthMask];
@@ -728,16 +735,14 @@
 
                         if ((entry & LiteralFlag) != 0)
                         {
-                            bits >>= (int)(entry & 0xFF);
-                            count -= (int)(entry & 0xFF);
+                            bits >>= (int)entry;
+                            count -= (int)entry;
                             *cursor++ = (byte)(entry >> ValueShift);
 
                             entry = literalLength[bits & literalLengthMask];
                             continue;
                         }
                     }
-
-                    var total = (int)(entry & 0xFF);
 
                     if ((entry & (EndOfBlockFlag | InvalidFlag)) != 0)
                     {
@@ -747,20 +752,20 @@
                             break;
                         }
 
-                        bits >>= total;
-                        count -= total;
+                        bits >>= (int)entry;
+                        count -= (int)entry;
                         result = Outcome.Complete;
                         break;
                     }
 
                     var saved = bits;
-                    bits >>= total;
-                    count -= total;
+                    bits >>= (int)entry;
+                    count -= (int)entry;
 
-                    var length = (int)(entry >> ValueShift) + (int)((saved & ((1UL << total) - 1)) >> (int)((entry >> CodeLengthShift) & 0xF));
+                    var length = (int)(entry >> ValueShift) + ExtraBits(saved, entry);
 
                     bits |= Unsafe.ReadUnaligned<ulong>(input) << count;
-                    input += (63 - count) >> 3;
+                    input += (63 - (byte)count) >> 3;
                     count |= 56;
 
                     entry = distances[bits & distanceMask];
@@ -772,8 +777,6 @@
                         entry = distances[(entry >> ValueShift) + (bits & ((1u << (int)((entry >> CodeLengthShift) & 0xF)) - 1))];
                     }
 
-                    total = (int)(entry & 0xFF);
-
                     if ((entry & InvalidFlag) != 0)
                     {
                         result = Outcome.Damaged;
@@ -781,10 +784,10 @@
                     }
 
                     saved = bits;
-                    bits >>= total;
-                    count -= total;
+                    bits >>= (int)entry;
+                    count -= (int)entry;
 
-                    var distance = (int)(entry >> ValueShift) + (int)((saved & ((1UL << total) - 1)) >> (int)((entry >> CodeLengthShift) & 0xF));
+                    var distance = (int)(entry >> ValueShift) + ExtraBits(saved, entry);
 
                     if (distance > cursor - outputBase)
                     {
@@ -801,11 +804,30 @@
 
                 reader.Position = (int)(input - inputBase);
                 reader.Bits = bits;
-                reader.Count = count;
+                reader.Count = (byte)count;
                 written = (int)(cursor - outputBase);
 
                 return result;
             }
+        }
+
+        /// <summary>
+        /// The extra bits of a length or distance entry: of the bits the entry consumed, those above
+        /// the codeword. With BMI2 a single instruction clears the bits above the total, which it
+        /// takes from the low byte of the entry itself; the shift by the codeword length reads bits
+        /// 8 to 13 of the entry, of which 12 and 13 are flags no length or distance entry carries.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int ExtraBits(ulong saved, uint entry)
+        {
+#if NET
+            if (Bmi2.X64.IsSupported)
+            {
+                return (int)(Bmi2.X64.ZeroHighBits(saved, entry) >> (int)(entry >> CodeLengthShift));
+            }
+#endif
+
+            return (int)((saved & ((1UL << (int)(entry & 0xFF)) - 1)) >> (int)((entry >> CodeLengthShift) & 0xF));
         }
 
         /// <summary>

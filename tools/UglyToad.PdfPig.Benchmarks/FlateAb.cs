@@ -1,5 +1,6 @@
 ﻿using System.Buffers;
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using UglyToad.PdfPig.Filters.Flate;
 
@@ -20,11 +21,15 @@ namespace UglyToad.PdfPig.Benchmarks;
 /// as well.
 /// </para>
 /// <para>
-/// Run with <c>dotnet run -c Release -f net8.0 -p:FlateAb=true -- flate-ab [--filter] [folder [max-files [stride]]]</c>.
+/// Run with <c>dotnet run -c Release -f net8.0 -p:FlateAb=true -- flate-ab [--filter] [--libdeflate=path\libdeflate.dll] [folder [max-files [stride]]]</c>.
 /// Without <c>--filter</c> each stream is inflated into a buffer that already fits it, so that the
 /// decoding alone is compared; with it, the filter's plumbing is done around the inflater as the
 /// filter does it, a buffer rented at four times the input, kept as the result when it is three
 /// quarters full and copied into an exact array otherwise, so that the buffer handling is compared.
+/// With <c>--libdeflate</c> the native libdeflate, from the Windows binary of its GitHub release,
+/// is measured as a further row: the fastest whole-buffer inflater there is, as the ceiling. It
+/// cannot grow a buffer, so with the filter's plumbing it starts over in a buffer twice the size
+/// when the first is too small, which is what a caller of it has to do.
 /// </para>
 /// </remarks>
 internal static class FlateAb
@@ -50,6 +55,12 @@ internal static class FlateAb
     {
         var positional = args.Skip(1).Where(a => !a.StartsWith("--")).ToArray();
         var plumbing = args.Contains("--filter");
+        var libdeflatePath = args.FirstOrDefault(a => a.StartsWith("--libdeflate="))?.Substring("--libdeflate=".Length);
+
+        if (libdeflatePath != null)
+        {
+            LibDeflate.Load(libdeflatePath);
+        }
 
         var loaded = positional.Length > 0
             ? FlateStreams.Load(FlateStreams.Files(positional[0], positional.Length > 1 ? int.Parse(positional[1]) : int.MaxValue, positional.Length > 2 ? int.Parse(positional[2]) : 1), includePredictors: false)
@@ -91,6 +102,11 @@ internal static class FlateAb
                     RunCurrent(group, streams, buffers);
                 }
             }));
+        }
+
+        if (libdeflatePath != null)
+        {
+            rows.Add(($"libdeflate {LibDeflate.Version}", group => { if (plumbing) LibDeflate.WithPlumbing(group, streams); else LibDeflate.Run(group, streams, buffers); }));
         }
 
         var best = new long[rows.Count, groups.Length];
@@ -250,4 +266,90 @@ internal static class FlateAb
 
     /// <summary>Where results go, so that they are not optimised away.</summary>
     private static byte[]? Sink;
+
+    /// <summary>The native libdeflate, loaded from a path given on the command line, called on the same streams.</summary>
+    private static unsafe class LibDeflate
+    {
+        private const int Success = 0;
+        private const int InsufficientSpace = 3;
+
+        private static IntPtr decompressor;
+
+        public static string Version { get; private set; } = "";
+
+        public static void Load(string path)
+        {
+            var fullPath = Path.GetFullPath(path);
+
+            NativeLibrary.SetDllImportResolver(typeof(LibDeflate).Assembly, (name, assembly, searchPath) =>
+                name == "libdeflate" ? NativeLibrary.Load(fullPath) : IntPtr.Zero);
+
+            decompressor = libdeflate_alloc_decompressor();
+
+            if (decompressor == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("libdeflate_alloc_decompressor failed.");
+            }
+
+            Version = FileVersionInfo.GetVersionInfo(fullPath).FileVersion is { Length: > 0 } version ? version : "(native)";
+        }
+
+        /// <summary>Into a buffer that fits, the inflater alone.</summary>
+        public static void Run(int[] group, Memory<byte>[] streams, byte[][] buffers)
+        {
+            foreach (var s in group)
+            {
+                Decompress(streams[s].Span, buffers[s], out _);
+            }
+        }
+
+        /// <summary>The filter's buffer handling: a buffer at four times the input, twice as large and over again when that is not enough.</summary>
+        public static void WithPlumbing(int[] group, Memory<byte>[] streams)
+        {
+            foreach (var s in group)
+            {
+                var buffer = ArrayPool<byte>.Shared.Rent(Math.Max(4096, Math.Min(MaximumCapacity, streams[s].Length * 4)));
+                var kept = false;
+
+                try
+                {
+                    int result;
+                    nuint length;
+
+                    while ((result = Decompress(streams[s].Span, buffer, out length)) == InsufficientSpace)
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                        buffer = ArrayPool<byte>.Shared.Rent((int)Math.Min(MaximumCapacity, buffer.Length * 2L));
+                    }
+
+                    kept = Keep(buffer, result == Success ? (int)length : 0);
+                }
+                finally
+                {
+                    if (!kept)
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                }
+            }
+        }
+
+        private static int Decompress(ReadOnlySpan<byte> input, byte[] output, out nuint written)
+        {
+            fixed (byte* inPtr = input)
+            fixed (byte* outPtr = output)
+            {
+                nuint actual;
+                var result = libdeflate_deflate_decompress(decompressor, inPtr, (nuint)input.Length, outPtr, (nuint)output.Length, &actual);
+                written = actual;
+                return result;
+            }
+        }
+
+        [DllImport("libdeflate", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr libdeflate_alloc_decompressor();
+
+        [DllImport("libdeflate", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int libdeflate_deflate_decompress(IntPtr decompressor, byte* input, nuint inputLength, byte* output, nuint outputLength, nuint* actualOutputLength);
+    }
 }
