@@ -13,9 +13,6 @@
     /// </summary>
     public sealed class ArrayToken : IDataToken<IReadOnlyList<IToken>>
     {
-        // The hash is deep, over every entry, and is asked for only where a token serves as a
-        // dictionary key. Computing it in the constructor made every parsed object pay for it;
-        // it is computed on first use instead.
         private int hashCode;
         private bool hashCodeComputed;
 
