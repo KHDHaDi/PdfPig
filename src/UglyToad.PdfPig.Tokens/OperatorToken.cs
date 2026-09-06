@@ -124,8 +124,7 @@
         public static readonly OperatorToken StartXref = new OperatorToken("startxref");
 
         /// <summary>
-        /// The operators of a content stream, one instance each, so that recognising an operator
-        /// neither allocates nor takes the pool lock. The field names are the operators themselves.
+        /// Shared instances of the content stream operators.
         /// </summary>
         private static class Content
         {
@@ -246,8 +245,7 @@
         }
 
         /// <summary>
-        /// Create a new <see cref="OperatorToken"/> from the bytes of the operator as they stand
-        /// in the file. Known operators are returned as shared instances without allocating.
+        /// Create a new <see cref="OperatorToken"/> from the bytes of the operator, returning a shared instance for known operators.
         /// </summary>
         public static OperatorToken Create(ReadOnlySpan<byte> data)
         {

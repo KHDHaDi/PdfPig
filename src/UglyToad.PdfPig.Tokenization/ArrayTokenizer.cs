@@ -11,9 +11,6 @@
         private readonly StackDepthGuard stackDepthGuard;
         private readonly bool useLenientParsing;
 
-        // The tokens of an array are copied into the ArrayToken, so the list they are gathered in
-        // is kept and reused instead of being grown from empty for every array. A content stream
-        // with kerned text has one array per TJ operator.
         private List<IToken> gathered;
 
         public bool ReadsNextByte { get; } = false;

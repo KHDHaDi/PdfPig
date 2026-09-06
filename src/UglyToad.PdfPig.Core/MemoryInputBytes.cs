@@ -60,20 +60,19 @@
         }
 
         /// <summary>
-        /// The whole input, for tokenizers that find the end of a token in place rather than
-        /// through <see cref="MoveNext"/> one byte at a time.
+        /// The whole input.
         /// </summary>
-        internal ReadOnlySpan<byte> Span => memory.Span;
+        public ReadOnlySpan<byte> Span => memory.Span;
 
         /// <summary>
         /// The index of <see cref="CurrentByte"/> in <see cref="Span"/>, -1 before the first read.
         /// </summary>
-        internal int Position => currentOffset;
+        public int Position => currentOffset;
 
         /// <summary>
-        /// Moves onto the byte at <paramref name="index"/>, as a sequence of <see cref="MoveNext"/> calls would.
+        /// Moves onto the byte at <paramref name="index"/>.
         /// </summary>
-        internal void MoveTo(int index)
+        public void MoveTo(int index)
         {
             currentOffset = index;
             CurrentByte = memory.Span[index];
