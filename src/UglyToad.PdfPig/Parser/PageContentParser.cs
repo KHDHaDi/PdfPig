@@ -61,8 +61,12 @@
             var scanner = new CoreTokenScanner(inputBytes, false, stackDepthGuard, useLenientParsing: useLenientParsing);
 
             var precedingTokens = new List<IToken>();
-            // About one operation per 20 bytes of content on average (n=870,000 pdfs)
-            var graphicsStateOperations = new List<IGraphicsStateOperation>((int)Math.Min(inputBytes.Length / 16, 1 << 20));
+            // A page holds one operation per 24 bytes of content on average, one per 11 on the median page
+            // (n=834,000 pdfs), so no single divisor fits both ends. Below 16 the total allocation rises,
+            // from 16 to 32 it is flat, and of those 16 covers the most operations, so the fewest lists
+            // have to grow at all. The floor is for the 69 % of pages under 256 bytes, where a capacity of
+            // one or two entries costs more allocations than none. Only 36 pages held more than 256K.
+            var graphicsStateOperations = new List<IGraphicsStateOperation>((int)Math.Max(16, Math.Min(inputBytes.Length / 16, 256 * 1024)));
 
             var lastEndImageOffset = new long?();
 
