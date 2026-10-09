@@ -42,7 +42,7 @@ namespace UglyToad.PdfPig.Filters.CcittFax;
 /// </list>
 /// <para>The bit-reader refill scheduling and its sources are documented on
 /// <see cref="CcittFaxCompactBitReader"/>. The signed recovery algorithm is documented on
-/// <see cref="CompatibilityRowDecoder"/>.</para>
+/// <see cref="SignedRowDecoder"/>.</para>
 /// </remarks>
 internal static partial class CcittFaxCompactDecoder
 {

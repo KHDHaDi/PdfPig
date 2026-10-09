@@ -714,6 +714,37 @@ public class CcittFaxDecoderTests
         return data;
     }
 
+    /// <summary>Exercises the Int32 loop directly against independently generated pixels for every row family.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SignedPathMatchesIndependentPixels(bool lenient)
+    {
+        foreach (var image in GenerateTestImages())
+        {
+            var options = image.Options;
+            var actual = Enumerable.Repeat((byte)0xAA, image.Expected.Length).ToArray();
+            CcittFaxCompactDecoder.DecodeCompatibility(image.Input, actual, options.Width, options.Height,
+                options.Mode, options.Aligned, options.BlackIsOne, lenient);
+            AssertPixelsEqual(image.Expected, actual, options.Width, options.Height, image.Name);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void SignedModeLookaheadDoesNotDiscardCompleteRowsAtEndOfInput(bool lenient, bool blackIsOne)
+    {
+        // Eight V(0) bits describe eight white Group 4 rows. The final modes have fewer than
+        // seven bits available, so prefetched lookup handling must fall back to exact reads.
+        var actual = Enumerable.Repeat((byte)0xAA, 8).ToArray();
+        CcittFaxCompactDecoder.DecodeCompatibility(new byte[] { 0xFF }, actual, 8, 8,
+            CcittFaxCompressionType.Group4_2D, false, blackIsOne, lenient);
+        Assert.Equal(Enumerable.Repeat(blackIsOne ? (byte)0 : (byte)255, 8).ToArray(), actual);
+    }
+
     [Theory]
     [InlineData(65535)]
     [InlineData(65536)]

@@ -7,12 +7,16 @@ namespace UglyToad.PdfPig.Filters.CcittFax;
 internal static partial class CcittFaxCompactDecoder
 {
     /// <summary>
-    /// Decodes a CCITT row using signed color-change positions for wide or malformed input.
+    /// Decodes CCITT rows with the compact loop optimizations and signed color-change positions.
     /// </summary>
     /// <remarks>
     /// <para>Algorithm: decode the row's EOL/tag framing, then execute 1D runs or 2D horizontal,
     /// vertical and pass operations against the previous row's transitions. Int32 positions can
     /// represent wide rows and invalid negative or backwards transitions for policy validation.</para>
+    /// <para>Ordered rows use separate monotone reference cursors for white and black, packed
+    /// short-run pairs, one interval paint per horizontal pair, and prefetched ordinary 2D modes.
+    /// These are the same loop optimizations as UInt16 decoding. Exact reads handle short tails
+    /// and unknown prefixes without speculative truncation failures.</para>
     /// <para>Ordered black intervals are painted directly. After an invalid transition accepted in
     /// lenient mode, repaint the completed row in its recorded transition order.
     /// Sorting or normalizing these positions would change accepted malformed
@@ -25,9 +29,10 @@ internal static partial class CcittFaxCompactDecoder
     /// the former Apache-2.0 PdfPig decoder, whose C# port attributes
     /// <see href="https://github.com/apache/pdfbox/blob/e644c29279e276bde14ce7a33bdeef0cb1001b3e/pdfbox/src/main/java/org/apache/pdfbox/filter/CCITTFaxDecoderStream.java">this PDFBox decoder</see>.
     /// Signed storage, shared prefix lookups, direct painting and strict/lenient recovery are the
-    /// current PdfPig implementation.</para>
+    /// current PdfPig implementation. The signed loop adapts the UInt16 loop while retaining
+    /// the signed search sentinel, exact-read failures and recorded-order malformed-row rendering.</para>
     /// </remarks>
-    private sealed class CompatibilityRowDecoder
+    private struct SignedRowDecoder
     {
         private readonly int columns;
         private readonly CcittFaxCompressionType compressionType;
@@ -36,17 +41,19 @@ internal static partial class CcittFaxCompactDecoder
         // After an invalid transition in a lenient row, stop direct painting. Once the row
         // is decoded, clear it and render all recorded transitions without normalizing positions.
         private bool hasInvalidTransitions;
+        private bool referenceHasInvalidTransitions;
         private int[] referenceTransitions;
         private int[] currentTransitions;
         private int referenceTransitionCount;
         private int transitionCount;
         private int lastReferenceTransitionIndex;
-        internal CompatibilityRowDecoder(
+        internal SignedRowDecoder(
             int columns,
             CcittFaxCompressionType compressionType,
             bool encodedByteAlign,
             bool useLenientParsing)
         {
+            this = default;
             this.columns = columns;
             this.compressionType = compressionType;
             this.encodedByteAlign = encodedByteAlign;
@@ -61,44 +68,52 @@ internal static partial class CcittFaxCompactDecoder
             if (encodedByteAlign)
                 bitReader.AlignToByteBoundary();
             bool isOneDimensional;
-            switch (compressionType)
+#if NET8_0_OR_GREATER
+            if (T.IsGroup4)
+#else
+            if (default(T).IsGroup4)
+#endif
+                isOneDimensional = false;
+            else
             {
-                case CcittFaxCompressionType.ModifiedHuffman:
-                    isOneDimensional = true;
-                    break;
-                case CcittFaxCompressionType.Group4_2D:
-                    isOneDimensional = false;
-                    break;
-                case CcittFaxCompressionType.Group3_1D:
-                case CcittFaxCompressionType.Group3_2D:
-                    int precedingZeroCount = 0;
-                    while (true)
-                    {
-                        if (bitReader.ReadBitsExact(1) == 0)
+                switch (compressionType)
+                {
+                    case CcittFaxCompressionType.ModifiedHuffman:
+                        isOneDimensional = true;
+                        break;
+                    case CcittFaxCompressionType.Group4_2D:
+                        isOneDimensional = false;
+                        break;
+                    case CcittFaxCompressionType.Group3_1D:
+                    case CcittFaxCompressionType.Group3_2D:
+                        int precedingZeroCount = 0;
+                        while (true)
                         {
-                            // EOL needs at least eleven zeros before a one. Saturate at eleven
-                            // to accept longer fill sequences without overflowing the counter.
-                            if (precedingZeroCount < 11)
-                                precedingZeroCount++;
+                            if (bitReader.ReadBitsExact(1) == 0)
+                            {
+                                // EOL needs at least eleven zeros before a one. Saturate at eleven
+                                // to accept longer fill sequences without overflowing the counter.
+                                if (precedingZeroCount < 11)
+                                    precedingZeroCount++;
+                            }
+                            else if (precedingZeroCount >= 11)
+                                break;
+                            else
+                                precedingZeroCount = 0;
                         }
-                        else if (precedingZeroCount >= 11)
-                            break;
-                        else
-                            precedingZeroCount = 0;
-                    }
 
-                    isOneDimensional = compressionType == CcittFaxCompressionType.Group3_1D || bitReader.ReadBitsExact(1) != 0;
-                    break;
-                default:
-                    throw new InvalidOperationException(compressionType + " is not a supported compression type.");
+                        isOneDimensional = compressionType == CcittFaxCompressionType.Group3_1D || bitReader.ReadBitsExact(1) != 0;
+                        break;
+                    default:
+                        throw new InvalidOperationException(compressionType + " is not a supported compression type.");
+                }
             }
 
             if (!isOneDimensional)
             {
                 referenceTransitionCount = transitionCount;
-                var completedRowTransitions = currentTransitions;
-                currentTransitions = referenceTransitions;
-                referenceTransitions = completedRowTransitions;
+                referenceHasInvalidTransitions = hasInvalidTransitions;
+                (referenceTransitions, currentTransitions) = (currentTransitions, referenceTransitions);
             }
 
             transitionCount = 0;
@@ -106,9 +121,24 @@ internal static partial class CcittFaxCompactDecoder
             rowPixels.Fill(BlackIsOne<T>() ? (byte)0 : (byte)255);
             int pixelPosition = 0;
             bool isWhiteRun = true;
+            int whiteReferenceIndex = 0;
+            int blackReferenceIndex = 1;
+            int nextModeEntry = 0;
+            bool hasNextModeEntry = false;
             do
             {
-                int operation = isOneDimensional ? HorizontalMode : DecodeMode(ref bitReader);
+                int operation;
+                if (isOneDimensional)
+                    operation = HorizontalMode;
+                else if (hasNextModeEntry)
+                {
+                    hasNextModeEntry = false;
+                    bitReader.ConsumeBits(nextModeEntry & 7);
+                    operation = nextModeEntry >> 3;
+                }
+                else
+                    operation = DecodeMode(ref bitReader);
+
                 if (operation == UnknownMode)
                 {
                     if (useLenientParsing)
@@ -136,9 +166,12 @@ internal static partial class CcittFaxCompactDecoder
                             bitReader.ConsumeBits((int)(packedRunPair >> 12));
                             int firstRunEnd = pixelPosition + firstRunLength;
                             int secondRunEnd = firstRunEnd + secondRunLength;
-                            PaintDecodedRun<T>(rowPixels, pixelPosition, firstRunEnd, isWhiteRun);
+                            if (!isOneDimensional)
+                                PrepareNextMode(ref bitReader, out nextModeEntry, out hasNextModeEntry);
+                            // A horizontal pair contains one black interval, irrespective of its starting color.
+                            PaintBlackInterval<T>(rowPixels, isWhiteRun ? firstRunEnd : pixelPosition,
+                                isWhiteRun ? secondRunEnd : firstRunEnd);
                             currentTransitions[transitionCount++] = firstRunEnd;
-                            PaintDecodedRun<T>(rowPixels, firstRunEnd, secondRunEnd, !isWhiteRun);
                             currentTransitions[transitionCount++] = secondRunEnd;
                             pixelPosition = secondRunEnd;
                             continue;
@@ -146,34 +179,60 @@ internal static partial class CcittFaxCompactDecoder
                     }
 
                     int nextPosition = AddRunLength(pixelPosition, DecodeRunLength(ref bitReader, isWhiteRun));
-                    PaintDecodedRun<T>(rowPixels, pixelPosition, nextPosition, isWhiteRun);
-                    currentTransitions[transitionCount++] = nextPosition;
-                    pixelPosition = nextPosition;
                     if (isOneDimensional)
-                        isWhiteRun = !isWhiteRun;
-                    else
                     {
-                        nextPosition = AddRunLength(pixelPosition, DecodeRunLength(ref bitReader, !isWhiteRun));
-                        PaintDecodedRun<T>(rowPixels, pixelPosition, nextPosition, !isWhiteRun);
+                        PaintDecodedRun<T>(rowPixels, pixelPosition, nextPosition, isWhiteRun);
                         currentTransitions[transitionCount++] = nextPosition;
                         pixelPosition = nextPosition;
+                        isWhiteRun = !isWhiteRun;
+                    }
+                    else
+                    {
+                        currentTransitions[transitionCount++] = nextPosition;
+                        int secondRunEnd = AddRunLength(nextPosition, DecodeRunLength(ref bitReader, !isWhiteRun));
+                        PrepareNextMode(ref bitReader, out nextModeEntry, out hasNextModeEntry);
+                        if (!hasInvalidTransitions)
+                            PaintBlackInterval<T>(rowPixels, isWhiteRun ? nextPosition : pixelPosition,
+                                isWhiteRun ? secondRunEnd : nextPosition);
+                        currentTransitions[transitionCount++] = secondRunEnd;
+                        pixelPosition = secondRunEnd;
                     }
                 }
                 else
                 {
-                    int referenceTransitionIndex = FindReferenceTransition(pixelPosition, isWhiteRun);
+                    int referenceTransitionIndex;
+                    if (!hasInvalidTransitions && !referenceHasInvalidTransitions)
+                    {
+                        // Ordered rows use the same monotonically advancing color cursors as compact decoding.
+                        referenceTransitionIndex = isWhiteRun ? whiteReferenceIndex : blackReferenceIndex;
+                        while (referenceTransitionIndex < referenceTransitionCount && pixelPosition != 0
+                            && referenceTransitions[referenceTransitionIndex] <= pixelPosition)
+                            referenceTransitionIndex += 2;
+                        if (isWhiteRun)
+                            whiteReferenceIndex = referenceTransitionIndex;
+                        else
+                            blackReferenceIndex = referenceTransitionIndex;
+                        if (pixelPosition != 0 && referenceTransitionIndex >= referenceTransitionCount)
+                            referenceTransitionIndex = -1;
+                        else if (pixelPosition != 0)
+                            lastReferenceTransitionIndex = referenceTransitionIndex;
+                    }
+                    else
+                        referenceTransitionIndex = FindReferenceTransition(pixelPosition, isWhiteRun);
+
                     int nextPosition;
                     if (operation == PassMode)
                     {
+                        // Preserve the signed search's -1 sentinel: a missing b1 wraps pass to entry zero.
                         referenceTransitionIndex++;
                         nextPosition = referenceTransitionIndex >= referenceTransitionCount ? columns : referenceTransitions[referenceTransitionIndex];
                     }
                     else
-                    {
-                        nextPosition = checked((referenceTransitionIndex >= referenceTransitionCount || referenceTransitionIndex == -1 ? columns : referenceTransitions[referenceTransitionIndex]) + operation);
-                    }
+                        nextPosition = checked((referenceTransitionIndex >= referenceTransitionCount || referenceTransitionIndex == -1
+                            ? columns : referenceTransitions[referenceTransitionIndex]) + operation);
 
                     ValidateTransitionPosition(pixelPosition, nextPosition);
+                    PrepareNextMode(ref bitReader, out nextModeEntry, out hasNextModeEntry);
                     PaintDecodedRun<T>(rowPixels, pixelPosition, nextPosition, isWhiteRun);
                     pixelPosition = nextPosition;
                     if (operation != PassMode)
@@ -190,6 +249,14 @@ internal static partial class CcittFaxCompactDecoder
                 rowPixels.Fill(BlackIsOne<T>() ? (byte)0 : (byte)255);
                 RenderMalformedRow(rowPixels, BlackIsOne<T>());
             }
+        }
+
+        // Peek only a complete ordinary mode. Short tails and unmapped prefixes retain exact-read recovery.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void PrepareNextMode(ref CcittFaxCompactBitReader bitReader, out int entry, out bool available)
+        {
+            entry = bitReader.EnsureBits(7) ? ModeLookup[bitReader.PeekBufferedBits(7)] : 0;
+            available = entry != 0;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -468,7 +535,14 @@ internal static partial class CcittFaxCompactDecoder
         bool useLenientParsing)
     {
         var bitReader = new CcittFaxCompactBitReader(compressedInput);
-        if (blackIsOne)
+        if (compressionType == CcittFaxCompressionType.Group4_2D)
+        {
+            if (blackIsOne)
+                DecodeSignedRows<Group4BlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+            else
+                DecodeSignedRows<Group4BlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+        }
+        else if (blackIsOne)
             DecodeSignedRows<GeneralBlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
         else
             DecodeSignedRows<GeneralBlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
@@ -496,7 +570,7 @@ internal static partial class CcittFaxCompactDecoder
         where T : struct, ICcittRowPolicy
     {
         int rowByteCount = (columns + 7) / 8;
-        var rowDecoder = new CompatibilityRowDecoder(columns, compressionType, encodedByteAlign, useLenientParsing);
+        var rowDecoder = new SignedRowDecoder(columns, compressionType, encodedByteAlign, useLenientParsing);
         for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
             try
