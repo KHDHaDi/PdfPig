@@ -59,7 +59,8 @@ public class CcittFaxDecoderTests
         foreach (var lenient in new[] { false, true })
             foreach (var blackIsOne in new[] { false, true })
             {
-                var options = new DecodeOptions(columns, rows, k, blackIsOne: blackIsOne, endOfLine: k == 0);
+                // TIFF strips use their declared row count; Group 3 strips need not contain RTC.
+                var options = new DecodeOptions(columns, rows, k, blackIsOne: blackIsOne, endOfLine: k == 0, endOfBlock: k < 0);
                 var actual = new CcittFaxDecodeFilter(lenient).Decode(input,
                     CreateImageDictionary(options), DefaultFilterProvider.Instance, 0).ToArray();
                 Assert.Equal(((columns + 7) / 8) * rows, actual.Length);
@@ -513,6 +514,7 @@ public class CcittFaxDecoderTests
         var dictionary = new DictionaryToken(new Dictionary<NameToken, IToken>
         {
             [NameToken.Filter] = NameToken.CcittfaxDecode,
+            [NameToken.Height] = new NumericToken(1),
             [NameToken.DecodeParms] = parameters
         });
         var filter = new CcittFaxDecodeFilter(lenient);
@@ -523,7 +525,7 @@ public class CcittFaxDecoderTests
         };
         if (lenient)
         {
-            Assert.Equal(new byte[] { 0 }, filter.Decode(input, dictionary, TestFilterProvider.Instance, 0).ToArray());
+            Assert.Empty(filter.Decode(input, dictionary, TestFilterProvider.Instance, 0).ToArray());
         }
         else
         {
@@ -610,7 +612,7 @@ public class CcittFaxDecoderTests
                             row = "0000" + "000000000001" + row;
                         if (aligned)
                             row = row.PadRight((row.Length + 7) / 8 * 8, '0');
-                        byte[] input = PackBits(row + row);
+                        byte[] input = PackBits(row + row + string.Concat(Enumerable.Repeat("000000000001", 6)));
                         var expected = new byte[stride * 2];
                         for (int y = 0; y < 2; y++)
                             for (int x = w; x < width; x++)
@@ -849,11 +851,13 @@ public class CcittFaxDecoderTests
             [NameToken.K] = new NumericToken(options.K),
             [NameToken.EndOfLine] = options.EndOfLine ? BooleanToken.True : BooleanToken.False,
             [NameToken.EncodedByteAlign] = options.Aligned ? BooleanToken.True : BooleanToken.False,
-            [NameToken.BlackIs1] = options.BlackIsOne ? BooleanToken.True : BooleanToken.False
+            [NameToken.BlackIs1] = options.BlackIsOne ? BooleanToken.True : BooleanToken.False,
+            [NameToken.Create("EndOfBlock")] = options.EndOfBlock ? BooleanToken.True : BooleanToken.False
         });
         return new DictionaryToken(new Dictionary<NameToken, IToken>
         {
             [NameToken.Filter] = NameToken.CcittfaxDecode,
+            [NameToken.Height] = new NumericToken(options.Height),
             [NameToken.DecodeParms] = parameters
         });
     }
@@ -939,18 +943,23 @@ public class CcittFaxDecoderTests
         }
     }
 
+    /// <summary>Leading fill and a three-EOL trailer do not invalidate two intact declared rows.</summary>
+    /// <remarks>Rows=2 exactly matches the decoded image. Three EOLs are a shortened Group 3
+    /// RTC, not a standard six-EOL RTC. Both parsing modes accept this local compatibility
+    /// exception without interpreting the trailer as another white row.</remarks>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public void FillAndIncompleteRtcPreserveIntegratedAcceptance(bool lenient)
+    public void IncompleteRtcAfterDeclaredCompleteRowsIsAccepted(bool lenient)
     {
         const string eol = "000000000001";
         byte[] input = PackBits("0000" + eol + "10011" + "0000000" + eol + "10011" + eol + eol + eol);
         var options = new DecodeOptions(8, 2, 0, endOfLine: true);
         var dictionary = CreateImageDictionary(options);
-        var actual = new CcittFaxDecodeFilter(lenient).Decode(input, dictionary, DefaultFilterProvider.Instance, 0);
-        Assert.Equal(new byte[2], actual.ToArray());
-        Assert.Equal(DecodeMaster(input, options), actual.ToArray());
+        // Leading fill does not change the two complete rows. The shortened RTC is
+        // accepted only because their count matches Rows and the remaining bits are zero.
+        Assert.Equal(new byte[2], new CcittFaxDecodeFilter(lenient).Decode(input,
+            dictionary, DefaultFilterProvider.Instance, 0).ToArray());
     }
 
     // Empty input follows the filter policy rather than the signed decoder's white-row padding.
@@ -963,9 +972,10 @@ public class CcittFaxDecoderTests
             throw new CorruptCompressedDataException("Empty CCITT compressed data.");
         }
 
-        var output = new byte[(options.Width + 7) / 8 * options.Height];
-        CcittFaxCompactDecoder.DecodeCompatibility(input, output, options.Width, options.Height, options.Mode, options.Aligned, options.BlackIsOne, lenient);
-        return output;
+        return CcittFaxCompactDecoder.DecodeRowsToMemory(input, options.Width, options.Mode,
+            options.Aligned, options.BlackIsOne, lenient, true, options.EndOfBlock, 0,
+            out _, out _, requireEndOfLine: options.EndOfLine, maximumRows: options.EndOfBlock ? 0 : options.Height,
+            requireEndMarker: options.EndOfBlock && options.Height > 0, maximumStoredRows: options.Height).ToArray();
     }
 
     private static void AssertPixelsEqual(byte[] expected, byte[] actual, int width, int rows, string context)
@@ -1008,7 +1018,7 @@ public class CcittFaxDecoderTests
                 rle: mode == CcittFaxCompressionType.ModifiedHuffman,
                 aligned: aligned,
                 blackIsOne: blackIsOne,
-                endOfLine: mode != CcittFaxCompressionType.ModifiedHuffman)
+                endOfLine: mode == CcittFaxCompressionType.Group3_1D || mode == CcittFaxCompressionType.Group3_2D)
         {
         }
 
@@ -1072,9 +1082,14 @@ public class CcittFaxDecoderTests
             bits.Append("000000000001000000000001");
         }
 
-        if (!options.Rle && options.K == 0)
+        if (options.K >= 0 && options.EndOfBlock)
+        {
+            if (options.Aligned)
+                while ((bits.Length & 7) != 0)
+                    bits.Append('0');
             for (int i = 0; i < 6; i++)
-                bits.Append("000000000001");
+                bits.Append(options.K > 0 ? "0000000000011" : "000000000001");
+        }
         int stride = (options.Width + 7) / 8;
         var expected = new byte[stride * pixels.Length];
         for (int y = 0; y < pixels.Length; y++)

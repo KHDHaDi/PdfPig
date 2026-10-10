@@ -22,15 +22,22 @@ internal static partial class CcittFaxCompactDecoder
     /// Sorting or normalizing these positions would change accepted malformed
     /// input. Strict mode rejects invalid positions and codes.</para>
     /// <para>Input exhaustion discards the incomplete row while keeping earlier rows; a legal Group 4
-    /// end-of-facsimile-block marker also ends decoding. The outer row loop pads unfinished output
-    /// with white. Lenient mode additionally recovers from certain compressed-data errors; buffer
-    /// bounds failures and arithmetic overflow remain errors in both modes.</para>
+    /// EOFB or RTC marker also ends decoding when EndOfBlock is enabled. Fixed-height output pads
+    /// unfinished rows white. DamagedRowsBeforeError uses EOL resynchronization and replacement
+    /// pixels, rebuilding the reference row. The PDF filter stops at corrupt rows in lenient
+    /// parsing and throws in strict parsing; it does not invoke historical row repairs.
+    /// Fixed-size bitmap overloads retain legacy padding and lenient repairs; the PDF filter
+    /// uses variable-length output instead. Arithmetic overflow remains an error in both modes.</para>
     /// <para>Provenance: row/reference-transition and malformed bitmap-write rules are adapted from
     /// the former Apache-2.0 PdfPig decoder, whose C# port attributes
     /// <see href="https://github.com/apache/pdfbox/blob/e644c29279e276bde14ce7a33bdeef0cb1001b3e/pdfbox/src/main/java/org/apache/pdfbox/filter/CCITTFaxDecoderStream.java">this PDFBox decoder</see>.
     /// Signed storage, shared prefix lookups, direct painting and strict/lenient recovery are the
     /// current PdfPig implementation. The signed loop adapts the UInt16 loop while retaining
     /// the signed search sentinel, exact-read failures and recorded-order malformed-row rendering.</para>
+    /// <para>Optional EOL, EOFB/RTC and damaged-row substitution follow Adobe PDF Reference 1.7,
+    /// section 3.3.5; see
+    /// <see href="https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/pdfreference1.7old.pdf">PDF Reference</see>.
+    /// Reservoir probing, reference rebuilding and bounded unknown-height output are new C# code.</para>
     /// </remarks>
     private struct SignedRowDecoder
     {
@@ -38,6 +45,11 @@ internal static partial class CcittFaxCompactDecoder
         private readonly CcittFaxCompressionType compressionType;
         private readonly bool encodedByteAlign;
         private readonly bool useLenientParsing;
+        private readonly bool acceptOptionalEndOfLine;
+        private readonly bool endOfBlock;
+        private readonly bool recoverDamagedRows;
+        private readonly bool requireEndOfLine;
+        private bool pendingEndOfLine;
         // After an invalid transition in a lenient row, stop direct painting. Once the row
         // is decoded, clear it and render all recorded transitions without normalizing positions.
         private bool hasInvalidTransitions;
@@ -51,62 +63,89 @@ internal static partial class CcittFaxCompactDecoder
             int columns,
             CcittFaxCompressionType compressionType,
             bool encodedByteAlign,
-            bool useLenientParsing)
+            bool useLenientParsing, bool acceptOptionalEndOfLine, bool endOfBlock, bool recoverDamagedRows, bool requireEndOfLine)
         {
             this = default;
             this.columns = columns;
             this.compressionType = compressionType;
             this.encodedByteAlign = encodedByteAlign;
             this.useLenientParsing = useLenientParsing;
+            this.acceptOptionalEndOfLine = acceptOptionalEndOfLine;
+            this.endOfBlock = endOfBlock;
+            this.recoverDamagedRows = recoverDamagedRows;
+            this.requireEndOfLine = requireEndOfLine;
             referenceTransitions = new int[columns + 2];
             currentTransitions = new int[columns + 2];
+        }
+
+        /// <summary>Checks a row boundary before variable-length decoding starts another row.</summary>
+        /// <remarks>This recognizes the actual ending; the outer decoding loop decides whether
+        /// EOF is permitted by PDF Rows and parsing policy. pendingEndOfLine is an EOL already
+        /// consumed during damaged-row recovery, not evidence of clean row-boundary EOF. Test
+        /// markers before starting another row so their bits are not reported as a corrupt run.</remarks>
+        internal CcittFaxDecodeStatus ReadEndOfDataStatus(ref CcittFaxCompactBitReader reader,
+            bool allowIncompleteRtc = false, bool allowIncompleteEofb = false, bool allowSingleGroup3Eol = false, bool allowZeroFillAtEof = false)
+        {
+            // Validate EOF padding before alignment can discard unused bits.
+            // Arbitrary zero fill requires intact exact positive Rows, checked by the caller.
+            // Probe before alignment: otherwise discarded nonzero bits could hide corruption.
+            bool cleanEndOfInput = !pendingEndOfLine && (reader.HasOnlyBytePadding
+                || allowZeroFillAtEof && reader.TryReadZeroFillToEnd());
+            if (encodedByteAlign && !pendingEndOfLine)
+            {
+                allowIncompleteEofb &= reader.HasZeroAlignmentPadding;
+                allowSingleGroup3Eol &= reader.HasZeroAlignmentPadding;
+                reader.AlignToByteBoundary();
+            }
+            if (endOfBlock)
+            {
+                var status = reader.ReadEndOfBlockStatus(compressionType, pendingEndOfLine, allowIncompleteRtc, allowIncompleteEofb, allowSingleGroup3Eol);
+                if (status != CcittFaxDecodeStatus.NotCompleted)
+                    return status;
+            }
+            return cleanEndOfInput
+                ? CcittFaxDecodeStatus.EndOfInput : CcittFaxDecodeStatus.NotCompleted;
         }
 
         internal void DecodeRow<T>(ref CcittFaxCompactBitReader bitReader, Span<byte> rowPixels)
             where T : struct, ICcittRowPolicy
         {
-            if (encodedByteAlign)
+            if (encodedByteAlign && !pendingEndOfLine)
                 bitReader.AlignToByteBoundary();
+            if (endOfBlock && bitReader.TryReadEndOfBlock(compressionType, pendingEndOfLine))
+                throw new EndOfStreamException("CCITT end-of-block marker.");
             bool isOneDimensional;
-#if NET8_0_OR_GREATER
-            if (T.IsGroup4)
-#else
-            if (default(T).IsGroup4)
-#endif
+            if (compressionType == CcittFaxCompressionType.Group4_2D)
+            {
+                if (acceptOptionalEndOfLine)
+                {
+                    bool hasEol = bitReader.TryReadEndOfLine();
+                    if (requireEndOfLine && !hasEol)
+                        throw new CorruptCompressedDataException("Required CCITT EOL is missing.");
+                }
                 isOneDimensional = false;
+            }
+            else if (compressionType == CcittFaxCompressionType.ModifiedHuffman)
+            {
+                if (acceptOptionalEndOfLine)
+                    bitReader.TryReadEndOfLine();
+                isOneDimensional = true;
+            }
             else
             {
-                switch (compressionType)
+                if (!pendingEndOfLine)
                 {
-                    case CcittFaxCompressionType.ModifiedHuffman:
-                        isOneDimensional = true;
-                        break;
-                    case CcittFaxCompressionType.Group4_2D:
-                        isOneDimensional = false;
-                        break;
-                    case CcittFaxCompressionType.Group3_1D:
-                    case CcittFaxCompressionType.Group3_2D:
-                        int precedingZeroCount = 0;
-                        while (true)
-                        {
-                            if (bitReader.ReadBitsExact(1) == 0)
-                            {
-                                // EOL needs at least eleven zeros before a one. Saturate at eleven
-                                // to accept longer fill sequences without overflowing the counter.
-                                if (precedingZeroCount < 11)
-                                    precedingZeroCount++;
-                            }
-                            else if (precedingZeroCount >= 11)
-                                break;
-                            else
-                                precedingZeroCount = 0;
-                        }
-
-                        isOneDimensional = compressionType == CcittFaxCompressionType.Group3_1D || bitReader.ReadBitsExact(1) != 0;
-                        break;
-                    default:
-                        throw new InvalidOperationException(compressionType + " is not a supported compression type.");
+                    bool hasEol = bitReader.TryReadEndOfLine();
+                    if (requireEndOfLine && !hasEol)
+                    {
+                        if (!useLenientParsing)
+                            throw new CorruptCompressedDataException("Required CCITT EOL is missing.");
+                        if (!bitReader.TryResynchronizeAtEndOfLine())
+                            throw new EndOfStreamException("Required CCITT EOL not found before data ended.");
+                    }
                 }
+                pendingEndOfLine = false;
+                isOneDimensional = compressionType == CcittFaxCompressionType.Group3_1D || bitReader.ReadBitsExact(1) != 0;
             }
 
             if (!isOneDimensional)
@@ -143,12 +182,6 @@ internal static partial class CcittFaxCompactDecoder
                 {
                     if (useLenientParsing)
                         continue;
-                    if (compressionType == CcittFaxCompressionType.Group4_2D
-                        && pixelPosition == 0
-                        && transitionCount == 0
-                        && bitReader.ReadBitsExact(6) == 1
-                        && bitReader.ReadBitsExact(12) == 1)
-                        throw new EndOfStreamException("CCITT end-of-facsimile block.");
                     throw new CorruptCompressedDataException("Unknown code in CCITT 2D stream.");
                 }
 
@@ -251,6 +284,30 @@ internal static partial class CcittFaxCompactDecoder
             }
         }
 
+        /// <summary>Reuses a premature EOL already read, or searches for the next row boundary.</summary>
+        internal bool TryResynchronize(ref CcittFaxCompactBitReader reader) =>
+            pendingEndOfLine || reader.TryResynchronizeAtEndOfLine();
+
+        /// <summary>Rebuilds the next reference row from replacement pixels after EOL resynchronization.</summary>
+        /// <remarks>DamagedRowsBeforeError substitutes the previous undamaged row or white. Its
+        /// transitions must replace the failed row's partial state before the following 2D row.</remarks>
+        internal void UseReplacementRow(ReadOnlySpan<byte> pixels, bool blackIsOne)
+        {
+            transitionCount = 0;
+            bool previousIsBlack = false;
+            for (int x = 0; x < columns; x++)
+            {
+                bool isBlack = ((pixels[x >> 3] >> (7 - (x & 7))) & 1) == (blackIsOne ? 1 : 0);
+                if (isBlack != previousIsBlack)
+                    currentTransitions[transitionCount++] = x;
+                previousIsBlack = isBlack;
+            }
+            currentTransitions[transitionCount++] = columns;
+            hasInvalidTransitions = false;
+            lastReferenceTransitionIndex = 0;
+            pendingEndOfLine = true;
+        }
+
         // Peek only a complete ordinary mode. Short tails and unmapped prefixes retain exact-read recovery.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void PrepareNextMode(ref CcittFaxCompactBitReader bitReader, out int entry, out bool available)
@@ -321,6 +378,13 @@ internal static partial class CcittFaxCompactDecoder
                 }
                 else
                     runOrEolMarker = DecodeRunBitByBit(ref bitReader, isWhiteRun ? CcittFaxCodebook.WhiteRunCodes : CcittFaxCodebook.BlackRunCodes);
+                if (runOrEolMarker < 0 && (recoverDamagedRows || !useLenientParsing))
+                {
+                    // A premature EOL already gives the resynchronization point. Retain it
+                    // for the next row rather than skipping another complete row during recovery.
+                    pendingEndOfLine = true;
+                    throw new CorruptCompressedDataException("Premature EOL in CCITT run.");
+                }
                 accumulatedRunLength = checked(accumulatedRunLength + runOrEolMarker);
                 if (runOrEolMarker >= 0)
                     ValidateTransitionPosition(0, accumulatedRunLength);
@@ -365,7 +429,7 @@ internal static partial class CcittFaxCompactDecoder
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int DecodeMode(ref CcittFaxCompactBitReader bitReader)
+        private int DecodeMode(ref CcittFaxCompactBitReader bitReader)
         {
             if (bitReader.EnsureBits(7))
             {
@@ -377,8 +441,15 @@ internal static partial class CcittFaxCompactDecoder
                 }
             }
 
-            // Read unmapped prefixes one bit at a time. Six zero bits return the sentinel
-            // checked by DecodeRow for a legal Group 4 EOFB or a strict-mode error.
+            // EOL cannot be an ordinary mode prefix. Probe it only after the fast lookup
+            // misses, before consuming any of its bits during damaged-row recovery.
+            if (recoverDamagedRows && bitReader.TryReadEndOfLine())
+            {
+                pendingEndOfLine = true;
+                throw new CorruptCompressedDataException("Premature EOL in CCITT 2D row.");
+            }
+            // Read unmapped prefixes one bit at a time. Complete row-boundary end markers
+            // were handled before decoding; six zero bits here indicate an invalid mode.
             if (bitReader.ReadBitsExact(1) != 0)
                 return 0;
             int middleBits = bitReader.ReadBitsExact(2);
@@ -514,12 +585,16 @@ internal static partial class CcittFaxCompactDecoder
         CcittFaxCompressionType compressionType,
         bool encodedByteAlign,
         bool blackIsOne,
-        bool useLenientParsing)
+        bool useLenientParsing,
+        bool acceptOptionalEndOfLine = false,
+        bool endOfBlock = true,
+        int damagedRowsBeforeError = 0,
+        bool requireEndOfLine = true)
     {
-        if (TryDecode(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, blackIsOne))
+        if (TryDecode(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, blackIsOne, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine))
             return;
         // Rebuilding signed reference rows avoids per-row checkpoints on the compact fast path.
-        DecodeCompatibility(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, blackIsOne, useLenientParsing);
+        DecodeCompatibility(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, blackIsOne, useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, requireEndOfLine);
     }
 
     /// <summary>Decodes all requested rows through the signed-position recovery path.</summary>
@@ -532,20 +607,24 @@ internal static partial class CcittFaxCompactDecoder
         CcittFaxCompressionType compressionType,
         bool encodedByteAlign,
         bool blackIsOne,
-        bool useLenientParsing)
+        bool useLenientParsing,
+        bool acceptOptionalEndOfLine = false,
+        bool endOfBlock = true,
+        int damagedRowsBeforeError = 0,
+        bool requireEndOfLine = true)
     {
         var bitReader = new CcittFaxCompactBitReader(compressedInput);
         if (compressionType == CcittFaxCompressionType.Group4_2D)
         {
             if (blackIsOne)
-                DecodeSignedRows<Group4BlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+                DecodeSignedRows<Group4BlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, requireEndOfLine);
             else
-                DecodeSignedRows<Group4BlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+                DecodeSignedRows<Group4BlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, requireEndOfLine);
         }
         else if (blackIsOne)
-            DecodeSignedRows<GeneralBlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+            DecodeSignedRows<GeneralBlackIsOnePolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, requireEndOfLine);
         else
-            DecodeSignedRows<GeneralBlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing);
+            DecodeSignedRows<GeneralBlackIsZeroPolicy>(ref bitReader, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, requireEndOfLine);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -566,16 +645,33 @@ internal static partial class CcittFaxCompactDecoder
         int rowCount,
         CcittFaxCompressionType compressionType,
         bool encodedByteAlign,
-        bool useLenientParsing)
+        bool useLenientParsing,
+        bool acceptOptionalEndOfLine,
+        bool endOfBlock,
+        int damagedRowsBeforeError,
+        bool requireEndOfLine)
         where T : struct, ICcittRowPolicy
     {
         int rowByteCount = (columns + 7) / 8;
-        var rowDecoder = new SignedRowDecoder(columns, compressionType, encodedByteAlign, useLenientParsing);
+        var rowDecoder = new SignedRowDecoder(columns, compressionType, encodedByteAlign,
+            useLenientParsing && damagedRowsBeforeError == 0, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError > 0, requireEndOfLine);
+        int damagedRowCount = 0;
+        bool previousRowWasDamaged = false;
         for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
             try
             {
                 rowDecoder.DecodeRow<T>(ref bitReader, decodedBitmap.AsSpan(rowIndex * rowByteCount, rowByteCount));
+                previousRowWasDamaged = false;
+            }
+            catch (Exception exception) when (damagedRowsBeforeError > 0
+                && (exception is CorruptCompressedDataException || exception is IndexOutOfRangeException))
+            {
+                RecoverDamagedRow(ref rowDecoder, ref bitReader,
+                    decodedBitmap.AsSpan(rowIndex * rowByteCount, rowByteCount),
+                    rowIndex == 0 ? ReadOnlySpan<byte>.Empty : decodedBitmap.AsSpan((rowIndex - 1) * rowByteCount, rowByteCount),
+                    BlackIsOne<T>(), previousRowWasDamaged, ref damagedRowCount, damagedRowsBeforeError);
+                previousRowWasDamaged = true;
             }
             catch (IndexOutOfRangeException exception)
             {
@@ -588,17 +684,192 @@ internal static partial class CcittFaxCompactDecoder
             // Exhausted input or a legal EOFB ends decoding in both parsing modes. Corrupt
             // codes end decoding this way only in lenient mode. Keep earlier complete rows;
             // discard the current row and fill it and the remaining rows white, including padding.
-            // Bounds failures and arithmetic overflow above always propagate as corruption.
+            // Arithmetic overflow always propagates. Bounds failures can be resynchronized only
+            // when an explicit damaged-row budget is active.
             catch (EndOfStreamException)
             {
                 decodedBitmap.AsSpan(rowIndex * rowByteCount).Fill(BlackIsOne<T>() ? (byte)0 : (byte)255);
                 return;
             }
-            catch (CorruptCompressedDataException) when (useLenientParsing)
+            catch (CorruptCompressedDataException exception) when (useLenientParsing && exception.InnerException is not IndexOutOfRangeException && exception.InnerException is not OverflowException)
             {
                 decodedBitmap.AsSpan(rowIndex * rowByteCount).Fill(BlackIsOne<T>() ? (byte)0 : (byte)255);
                 return;
             }
         }
     }
+    private static void DecodeSignedRow<T>(ref SignedRowDecoder decoder,
+        ref CcittFaxCompactBitReader reader, Span<byte> pixels) where T : struct, ICcittRowPolicy
+    {
+        try
+        {
+            decoder.DecodeRow<T>(ref reader, pixels);
+        }
+        catch (IndexOutOfRangeException exception)
+        {
+            throw new CorruptCompressedDataException("Malformed CCITT stream: decoder buffer bounds exceeded.", exception);
+        }
+        catch (OverflowException exception)
+        {
+            throw new CorruptCompressedDataException("Malformed CCITT stream: run arithmetic overflow.", exception);
+        }
+    }
+
+    private static void RecoverDamagedRow(ref SignedRowDecoder decoder, ref CcittFaxCompactBitReader reader,
+        Span<byte> pixels, ReadOnlySpan<byte> previousPixels, bool blackIsOne, bool previousRowWasDamaged,
+        ref int damagedRowCount, int damagedRowsBeforeError)
+    {
+        if (++damagedRowCount > damagedRowsBeforeError)
+            throw new CorruptCompressedDataException("CCITT damaged-row budget exceeded.");
+        if (!decoder.TryResynchronize(ref reader))
+            throw new CorruptCompressedDataException("Cannot resynchronize damaged CCITT row at EOL.");
+        if (!previousPixels.IsEmpty && !previousRowWasDamaged)
+            previousPixels.CopyTo(pixels);
+        else
+            pixels.Fill(blackIsOne ? (byte)0 : (byte)255);
+        decoder.UseReplacementRow(pixels, blackIsOne);
+    }
+
+    /// <summary>Returns complete rows up to the PDF stopping condition without synthesizing missing rows.</summary>
+    /// <remarks>maximumRows = 0 permits unknown height; otherwise it bounds the number of decoded rows.
+    /// Strict parsing rejects incomplete rows and missing required markers unless an enabled, validated
+    /// termination exception applies. Exact declared rows must not include substituted damaged rows. MemoryStream capacity is bounded;
+    /// resizing accounts for both old and new arrays, the row buffer and signed transitions.
+    /// Return the used portion of its owned buffer without a second full-size copy.</remarks>
+    internal static Memory<byte> DecodeRowsToMemory(ReadOnlySpan<byte> input, int columns,
+        CcittFaxCompressionType compressionType, bool encodedByteAlign, bool blackIsOne,
+        bool useLenientParsing, bool acceptOptionalEndOfLine, bool endOfBlock, int damagedRowsBeforeError,
+        long maximumDecodeBufferBytes = CcittFaxDecodeFilter.MaximumDecodeBufferBytes,
+        bool requireEndOfLine = true, int maximumRows = 0, bool requireEndMarker = false, bool allowEndTolerance = false,
+        int expectedRowsForEndTolerance = 0)
+        => DecodeRowsToMemory(input, columns, compressionType, encodedByteAlign, blackIsOne,
+            useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError,
+            out _, out _, maximumDecodeBufferBytes, requireEndOfLine, maximumRows, requireEndMarker, allowEndTolerance, expectedRowsForEndTolerance);
+
+    /// <summary>Returns pixels, byte-rounded consumption and the stopping condition from the signed path.</summary>
+    /// <remarks>maximumStoredRows bounds image output without changing the decoded row count used
+    /// for termination. Excess rows are still validated in the reusable row buffer. NotCompleted
+    /// offsets describe the failed decode, not an accepted image boundary.</remarks>
+    internal static Memory<byte> DecodeRowsToMemory(ReadOnlySpan<byte> input, int columns,
+        CcittFaxCompressionType compressionType, bool encodedByteAlign, bool blackIsOne,
+        bool useLenientParsing, bool acceptOptionalEndOfLine, bool endOfBlock, int damagedRowsBeforeError,
+        out int bytesConsumed, out CcittFaxDecodeStatus status,
+        long maximumDecodeBufferBytes = CcittFaxDecodeFilter.MaximumDecodeBufferBytes,
+        bool requireEndOfLine = true, int maximumRows = 0, bool requireEndMarker = false, bool allowEndTolerance = false,
+        int expectedRowsForEndTolerance = 0, int maximumStoredRows = 0)
+    {
+        var reader = new CcittFaxCompactBitReader(input);
+        return blackIsOne
+            ? DecodeRowsToMemory<GeneralBlackIsOnePolicy>(ref reader, columns, compressionType, encodedByteAlign,
+                useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, maximumDecodeBufferBytes, requireEndOfLine, maximumRows, requireEndMarker, allowEndTolerance, expectedRowsForEndTolerance, maximumStoredRows, out bytesConsumed, out status)
+            : DecodeRowsToMemory<GeneralBlackIsZeroPolicy>(ref reader, columns, compressionType, encodedByteAlign,
+                useLenientParsing, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError, maximumDecodeBufferBytes, requireEndOfLine, maximumRows, requireEndMarker, allowEndTolerance, expectedRowsForEndTolerance, maximumStoredRows, out bytesConsumed, out status);
+    }
+
+    private static Memory<byte> DecodeRowsToMemory<T>(ref CcittFaxCompactBitReader reader, int columns,
+        CcittFaxCompressionType compressionType, bool encodedByteAlign, bool useLenientParsing,
+        bool acceptOptionalEndOfLine, bool endOfBlock, int damagedRowsBeforeError, long maximumDecodeBufferBytes, bool requireEndOfLine, int maximumRows, bool requireEndMarker, bool allowEndTolerance, int expectedRowsForEndTolerance, int maximumStoredRows,
+        out int bytesConsumed, out CcittFaxDecodeStatus status) where T : struct, ICcittRowPolicy
+    {
+        bytesConsumed = 0;
+        status = CcittFaxDecodeStatus.RowLimit;
+        int rowByteCount = (columns + 7) / 8;
+        // Explicit damaged-row recovery needs the preceding decoded row even after image
+        // storage has stopped. Keep it separately rather than referring to the last stored row.
+        long workingBytes = rowByteCount + 2L * (columns + 2) * sizeof(int)
+            + (damagedRowsBeforeError > 0 ? rowByteCount : 0);
+        if (workingBytes > maximumDecodeBufferBytes)
+            throw new CorruptCompressedDataException("CCITT growing decode buffers exceed the allocation budget.");
+        var decoder = new SignedRowDecoder(columns, compressionType, encodedByteAlign,
+            // PDF rows are never repaired implicitly. Lenient parsing may stop at a failed row;
+            // only the explicit damage budget permits resynchronization and substitution.
+            false, acceptOptionalEndOfLine, endOfBlock, damagedRowsBeforeError > 0, requireEndOfLine);
+        var rowPixels = new byte[rowByteCount];
+        using var output = new MemoryStream();
+        int decodedRowCount = 0;
+        var previousRowPixels = damagedRowsBeforeError > 0 ? new byte[rowByteCount] : null;
+        int damagedRowCount = 0;
+        bool previousRowWasDamaged = false;
+        while (maximumRows == 0 || decodedRowCount < maximumRows)
+        {
+            // Stored output length does not count discarded rows. A substituted damaged row
+            // also counts as a decoded row but cannot authorize a shortened ending. Count all repairs, even if later rows decoded
+            // successfully, before allowing declared-Rows EOF or shortened termination.
+            bool exactDeclaredRows = expectedRowsForEndTolerance > 0 && damagedRowCount == 0
+                && decodedRowCount == expectedRowsForEndTolerance;
+            var endStatus = decoder.ReadEndOfDataStatus(ref reader, allowEndTolerance && decodedRowCount > 0
+                && (expectedRowsForEndTolerance == 0 || exactDeclaredRows),
+                allowIncompleteEofb: allowEndTolerance && exactDeclaredRows,
+                allowSingleGroup3Eol: allowEndTolerance && exactDeclaredRows,
+                allowZeroFillAtEof: allowEndTolerance && exactDeclaredRows);
+            if (endStatus != CcittFaxDecodeStatus.NotCompleted)
+            {
+                status = endStatus;
+                // A full marker always wins over Rows. IncompleteEndOfBlock was already
+                // authorized by the guarded probe; clean EOF needs its exact-Rows check here.
+                // Lenient rejection retains the decoded prefix, but marks it NotCompleted.
+                if (requireEndMarker && status != CcittFaxDecodeStatus.EndOfBlock
+                    && status != CcittFaxDecodeStatus.IncompleteEndOfBlock
+                    && !(status == CcittFaxDecodeStatus.EndOfInput && allowEndTolerance && exactDeclaredRows))
+                {
+                    if (!useLenientParsing)
+                        throw new CorruptCompressedDataException("Required CCITT end-of-block marker is missing.");
+                    status = CcittFaxDecodeStatus.NotCompleted;
+                }
+                break;
+            }
+            if (maximumStoredRows > 0 && (long)(decodedRowCount + 1) * rowByteCount > maximumDecodeBufferBytes)
+                throw new CorruptCompressedDataException("CCITT decoded rows exceed the work budget.");
+            try
+            {
+                DecodeSignedRow<T>(ref decoder, ref reader, rowPixels);
+                previousRowWasDamaged = false;
+            }
+            catch (EndOfStreamException exception)
+            {
+                // Row-boundary exhaustion was handled above; EOF here interrupts a started row.
+                if (!useLenientParsing)
+                    throw new CorruptCompressedDataException("Truncated CCITT row.", exception);
+                status = CcittFaxDecodeStatus.NotCompleted;
+                break;
+            }
+            catch (CorruptCompressedDataException exception) when (damagedRowsBeforeError > 0 && exception.InnerException is not OverflowException)
+            {
+                RecoverDamagedRow(ref decoder, ref reader, rowPixels,
+                    decodedRowCount == 0 ? ReadOnlySpan<byte>.Empty : previousRowPixels.AsSpan(),
+                    BlackIsOne<T>(), previousRowWasDamaged, ref damagedRowCount, damagedRowsBeforeError);
+                previousRowWasDamaged = true;
+            }
+            catch (CorruptCompressedDataException exception) when (useLenientParsing && exception.InnerException is not IndexOutOfRangeException && exception.InnerException is not OverflowException)
+            {
+                status = CcittFaxDecodeStatus.NotCompleted;
+                break;
+            }
+            if (maximumStoredRows == 0 || decodedRowCount < maximumStoredRows)
+            {
+                EnsureUnknownRowCapacity(output, rowByteCount, workingBytes, maximumDecodeBufferBytes);
+                output.Write(rowPixels, 0, rowByteCount);
+            }
+            if (previousRowPixels is not null)
+                rowPixels.AsSpan().CopyTo(previousRowPixels);
+            decodedRowCount++;
+        }
+        if (status != CcittFaxDecodeStatus.NotCompleted)
+            reader.AlignToByteBoundary();
+        bytesConsumed = reader.BytesConsumed;
+        return output.Length == 0 ? Memory<byte>.Empty : output.GetBuffer().AsMemory(0, (int)output.Length);
+    }
+
+    private static void EnsureUnknownRowCapacity(MemoryStream output, int rowByteCount, long workingBytes, long maximumDecodeBufferBytes)
+    {
+        long requiredCapacity = output.Length + rowByteCount;
+        if (requiredCapacity <= output.Capacity)
+            return;
+        long availableBytes = maximumDecodeBufferBytes - workingBytes - output.Capacity;
+        long newCapacity = Math.Min(Math.Max(requiredCapacity, Math.Max(4096L, 2L * output.Capacity)), availableBytes);
+        if (newCapacity < requiredCapacity)
+            throw new CorruptCompressedDataException("CCITT growing decode buffers exceed the allocation budget.");
+        output.Capacity = (int)newCapacity;
+    }
+
 }

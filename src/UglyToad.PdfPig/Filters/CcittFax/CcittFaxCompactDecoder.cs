@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.CompilerServices;
+using UglyToad.PdfPig.Fonts;
 
 namespace UglyToad.PdfPig.Filters.CcittFax;
 /// <summary>
@@ -34,7 +35,7 @@ namespace UglyToad.PdfPig.Filters.CcittFax;
 /// <item><term>libdeflate fast loop (MIT)</term><description>Idea of preparing the next operation
 /// before completing independent output work. This decoder peeks the next CCITT mode before
 /// painting and consumes it on the next iteration. No libdeflate code or tables were copied.
-/// See <see href="https://github.com/ebiggers/libdeflate/blob/master/lib/decompress_template.h">decompression loop</see>.
+/// See <see href="https://github.com/ebiggers/libdeflate/blob/8ae3a19a59173f16e3738d45b54a1cdf05ad12d4/lib/decompress_template.h">decompression loop</see>.
 /// </description></item>
 /// <item><term>This PdfPig implementation (Apache-2.0)</term><description>The flat lookup builders,
 /// packed short-run pairs, compact transition storage, polarity-aware interval painter, generic
@@ -241,7 +242,10 @@ internal static partial class CcittFaxCompactDecoder
     /// <param name="compressionType">Resolved row framing and coding family.</param>
     /// <param name="encodedByteAlign">Whether each row starts at a byte boundary.</param>
     /// <param name="blackIsOne">Whether black pixels are represented by one bits.</param>
-    /// <returns>True when all requested rows were decoded on the compact path; otherwise false.
+    /// <param name="acceptOptionalEndOfLine">Accepts optional framing EOL in Modified Huffman rows.</param>
+    /// <param name="endOfBlock">Stops at complete EOFB/RTC markers and pads the remaining bitmap white.</param>
+    /// <param name="requireEndOfLine">Requires EOL before Group 3 rows; false permits optional framing.</param>
+    /// <returns>True when the bitmap was completed on the compact path; otherwise false.
     /// A width above UInt16 returns without changing output. Invalid or truncated input clears
     /// output so the caller can restart through the signed decoder.</returns>
     internal static bool TryDecode(
@@ -251,31 +255,98 @@ internal static partial class CcittFaxCompactDecoder
         int rowCount,
         CcittFaxCompressionType compressionType,
         bool encodedByteAlign,
-        bool blackIsOne)
+        bool blackIsOne,
+        bool acceptOptionalEndOfLine = false,
+        bool endOfBlock = true,
+        bool requireEndOfLine = true)
+    => TryDecodeBitmap(compressedInput, decodedBitmap, columns, rowCount, compressionType,
+        encodedByteAlign, blackIsOne, out _, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine);
+
+    /// <summary>Reports complete rows, optionally verifying termination after the capacity hint.</summary>
+    /// <remarks>End tolerance permits shortened Group 3 RTCs after complete rows. Clean EOF and a
+    /// single Group 3/4 EOL additionally require an exact positive expectedRowsForEndTolerance count.</remarks>
+    internal static bool TryDecodeBitmap(ReadOnlySpan<byte> compressedInput, byte[] decodedBitmap,
+        int columns, int rowCount, CcittFaxCompressionType compressionType, bool encodedByteAlign,
+        bool blackIsOne, out int decodedRowCount, bool acceptOptionalEndOfLine,
+        bool endOfBlock, bool requireEndOfLine, bool verifyEndMarker = false, bool allowEndTolerance = false,
+        int expectedRowsForEndTolerance = 0, bool allowEndOfInput = false)
+        => TryDecodeBitmap(compressedInput, decodedBitmap, columns, rowCount, compressionType,
+            encodedByteAlign, blackIsOne, out decodedRowCount, out _, out _, acceptOptionalEndOfLine,
+            endOfBlock, requireEndOfLine, verifyEndMarker, allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput);
+
+    /// <summary>Reports complete rows and byte-rounded consumption; failed attempts have no usable boundary.</summary>
+    /// <remarks>rowCount is bitmap capacity, not necessarily PDF Rows. expectedRowsForEndTolerance
+    /// is the separate PDF value (zero means unknown). allowEndOfInput admits clean EOF without
+    /// a declared count; allowEndTolerance additionally enables the narrow known-Rows and
+    /// shortened-marker exceptions. A false return clears output and consumption: the caller
+    /// must restart the growing decoder from the original input, not this attempt's lookahead.</remarks>
+    internal static bool TryDecodeBitmap(ReadOnlySpan<byte> compressedInput, byte[] decodedBitmap,
+        int columns, int rowCount, CcittFaxCompressionType compressionType, bool encodedByteAlign,
+        bool blackIsOne, out int decodedRowCount, out int bytesConsumed, out CcittFaxDecodeStatus status,
+        bool acceptOptionalEndOfLine, bool endOfBlock, bool requireEndOfLine,
+        bool verifyEndMarker = false, bool allowEndTolerance = false,
+        int expectedRowsForEndTolerance = 0, bool allowEndOfInput = false)
+        => TryDecodeBitmap(compressedInput, ref decodedBitmap, columns, rowCount, compressionType,
+            encodedByteAlign, blackIsOne, out decodedRowCount, out bytesConsumed, out status,
+            out _, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine, verifyEndMarker,
+            allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput);
+
+    /// <summary>Decodes with optional bounded bitmap growth, preserving input and reference-row state.</summary>
+    /// <remarks>A positive growth budget permits rows beyond the initial capacity. Every allocated
+    /// bitmap, including replaced arrays awaiting collection, and both transition arrays count
+    /// towards allocatedBufferBytes. The caller reserves that amount if signed decoding retries.
+    /// Marker and clean-EOF checks precede growth, so termination exactly at capacity needs no
+    /// new allocation. With EndOfBlock=false and unknown PDF Rows, the caller may supply Height
+    /// as initial capacity and a growth budget; Height does not become a row limit.
+    /// maximumStoredRows limits image output only: excess rows are validated in a reusable scratch
+    /// row until the encoded stopping condition. decodedRowCount still counts all complete rows.
+    /// maximumDecodedRows supplies the independent positive PDF Rows limit when EndOfBlock=false.
+    /// The growth budget also bounds logical decoded bytes when image output is capped.
+    /// A zero budget retains the fixed-capacity behavior used by bitmap callers.</remarks>
+    internal static bool TryDecodeBitmap(ReadOnlySpan<byte> compressedInput, ref byte[] decodedBitmap,
+        int columns, int rowCount, CcittFaxCompressionType compressionType, bool encodedByteAlign,
+        bool blackIsOne, out int decodedRowCount, out int bytesConsumed, out CcittFaxDecodeStatus status, out long allocatedBufferBytes,
+        bool acceptOptionalEndOfLine, bool endOfBlock, bool requireEndOfLine,
+        bool verifyEndMarker = false, bool allowEndTolerance = false,
+        int expectedRowsForEndTolerance = 0, bool allowEndOfInput = false, long maximumGrowthBufferBytes = 0,
+        int maximumStoredRows = 0, int maximumDecodedRows = 0)
     {
+        allocatedBufferBytes = decodedBitmap.Length + 2L * (columns + 2) * sizeof(ushort);
+        if (maximumGrowthBufferBytes > 0 && allocatedBufferBytes > maximumGrowthBufferBytes)
+            throw new CorruptCompressedDataException("CCITT compact decode buffers exceed the allocation budget.");
+        decodedRowCount = 0;
+        bytesConsumed = 0;
+        status = CcittFaxDecodeStatus.NotCompleted;
         if (columns > ushort.MaxValue)
             return false;
         try
         {
+            var bitReader = new CcittFaxCompactBitReader(compressedInput);
+            CompactDecodeResult result;
             if (compressionType == CcittFaxCompressionType.Group4_2D)
             {
                 if (blackIsOne)
-                    DecodeCompactRows<Group4BlackIsOnePolicy>(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign);
+                    result = DecodeCompactRows<Group4BlackIsOnePolicy>(ref bitReader, ref decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine, verifyEndMarker, allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput, maximumGrowthBufferBytes, ref allocatedBufferBytes, maximumStoredRows, maximumDecodedRows);
                 else
-                    DecodeCompactRows<Group4BlackIsZeroPolicy>(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign);
+                    result = DecodeCompactRows<Group4BlackIsZeroPolicy>(ref bitReader, ref decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine, verifyEndMarker, allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput, maximumGrowthBufferBytes, ref allocatedBufferBytes, maximumStoredRows, maximumDecodedRows);
             }
             else
             {
                 if (blackIsOne)
-                    DecodeCompactRows<GeneralBlackIsOnePolicy>(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign);
+                    result = DecodeCompactRows<GeneralBlackIsOnePolicy>(ref bitReader, ref decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine, verifyEndMarker, allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput, maximumGrowthBufferBytes, ref allocatedBufferBytes, maximumStoredRows, maximumDecodedRows);
                 else
-                    DecodeCompactRows<GeneralBlackIsZeroPolicy>(compressedInput, decodedBitmap, columns, rowCount, compressionType, encodedByteAlign);
+                    result = DecodeCompactRows<GeneralBlackIsZeroPolicy>(ref bitReader, ref decodedBitmap, columns, rowCount, compressionType, encodedByteAlign, acceptOptionalEndOfLine, endOfBlock, requireEndOfLine, verifyEndMarker, allowEndTolerance, expectedRowsForEndTolerance, allowEndOfInput, maximumGrowthBufferBytes, ref allocatedBufferBytes, maximumStoredRows, maximumDecodedRows);
             }
 
+            decodedRowCount = result.Rows;
+            bytesConsumed = bitReader.BytesConsumed;
+            status = result.Status;
             return true;
         }
         catch (InvalidDataException)
         {
+            bytesConsumed = 0;
+            status = CcittFaxDecodeStatus.NotCompleted;
             decodedBitmap.AsSpan().Clear();
             return false;
         }
@@ -321,13 +392,32 @@ internal static partial class CcittFaxCompactDecoder
 #endif
     }
 
-    private static void DecodeCompactRows<T>(
-        ReadOnlySpan<byte> compressedInput,
-        byte[] decodedBitmap,
+    // Return metadata only after the row loop; no out-parameter references stay live in that loop.
+    private readonly struct CompactDecodeResult
+    {
+        internal readonly int Rows;
+        internal readonly CcittFaxDecodeStatus Status;
+
+        internal CompactDecodeResult(int rows, CcittFaxDecodeStatus status)
+        {
+            Rows = rows;
+            Status = status;
+        }
+    }
+
+    private static CompactDecodeResult DecodeCompactRows<T>(
+        ref CcittFaxCompactBitReader bitReader,
+        ref byte[] decodedBitmap,
         int columns,
         int rowCount,
         CcittFaxCompressionType compressionType,
-        bool encodedByteAlign)
+        bool encodedByteAlign,
+        bool acceptOptionalEndOfLine,
+        bool endOfBlock,
+        bool requireEndOfLine,
+        bool verifyEndMarker,
+        bool allowEndTolerance, int expectedRowsForEndTolerance, bool allowEndOfInput,
+        long maximumGrowthBufferBytes, ref long allocatedBufferBytes, int maximumStoredRows, int maximumDecodedRows)
         where T : struct, ICcittRowPolicy
     {
         int rowByteCount = (columns + 7) / 8;
@@ -337,10 +427,71 @@ internal static partial class CcittFaxCompactDecoder
         var referenceTransitions = new ushort[columns + 2];
         var currentTransitions = new ushort[columns + 2];
         int referenceTransitionCount = 0;
-        var bitReader = new CcittFaxCompactBitReader(compressedInput);
-        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
+        byte[]? discardedRow = null;
+        int rowIndex = 0;
+        for (; (rowIndex < rowCount || maximumGrowthBufferBytes > 0 || maximumStoredRows > 0)
+            && (maximumDecodedRows == 0 || rowIndex < maximumDecodedRows); rowIndex++)
         {
-            var rowPixels = decodedBitmap.AsSpan(rowIndex * rowByteCount, rowByteCount);
+            // rowIndex counts completed rows; rowCount is merely this bitmap's capacity.
+            // Compact rows are never substituted. Only the independent PDF Rows value can
+            // authorize known-height EOF or a single Group 3/4 EOL, not the Height hint.
+            bool exactDeclaredRows = expectedRowsForEndTolerance > 0 && rowIndex == expectedRowsForEndTolerance;
+            // Unknown Rows allow final-byte padding only. Exact positive Rows additionally
+            // authorize all-zero fill through EOF, including whole bytes. This local policy
+            // trusts the intact declared image even though a truncated extra code can be all zero.
+            bool cleanEndOfInput = rowIndex > 0 && ((allowEndOfInput && bitReader.HasOnlyBytePadding)
+                || allowEndTolerance && exactDeclaredRows && bitReader.TryReadZeroFillToEnd());
+            bool allowSingleEol = allowEndTolerance && exactDeclaredRows
+                && (!encodedByteAlign || bitReader.HasZeroAlignmentPadding);
+            if (encodedByteAlign)
+                bitReader.AlignToByteBoundary();
+            if (endOfBlock)
+            {
+                var endStatus = bitReader.ReadEndOfBlockStatus(compressionType,
+                    allowIncompleteRtc: allowEndTolerance && rowIndex > 0
+                        && (expectedRowsForEndTolerance == 0 || exactDeclaredRows),
+                    allowIncompleteEofb: allowSingleEol, allowSingleGroup3Eol: allowSingleEol);
+                if (endStatus != CcittFaxDecodeStatus.NotCompleted)
+                {
+                    decodedBitmap.AsSpan(Math.Min(rowIndex, rowCount) * rowByteCount).Fill(BlackIsOne<T>() ? (byte)0 : (byte)255);
+                    bitReader.AlignToByteBoundary();
+                    return new CompactDecodeResult(rowIndex, endStatus);
+                }
+            }
+            // EOF follows complete rows with final-byte padding or authorized declared-Rows zero fill.
+            if (cleanEndOfInput)
+            {
+                bitReader.AlignToByteBoundary();
+                return new CompactDecodeResult(rowIndex, CcittFaxDecodeStatus.EndOfInput);
+            }
+            // The image output limit is independent of the encoded block's end. Decode
+            // excess rows into one reusable scratch row, retaining transitions for 2D coding.
+            // Count their logical decoded bytes too: discarding output must not remove the
+            // existing finite work bound supplied by the decode-buffer limit.
+            bool discardRow = maximumStoredRows > 0 && rowIndex >= maximumStoredRows;
+            if (discardRow && (long)(rowIndex + 1) * rowByteCount > maximumGrowthBufferBytes)
+                throw new CorruptCompressedDataException("CCITT decoded rows exceed the work budget.");
+            if (discardRow && discardedRow is null)
+            {
+                if (allocatedBufferBytes + rowByteCount > maximumGrowthBufferBytes)
+                    throw new CorruptCompressedDataException("CCITT compact decode buffers exceed the allocation budget.");
+                discardedRow = new byte[rowByteCount];
+                allocatedBufferBytes += rowByteCount;
+            }
+            if (rowIndex == rowCount && !discardRow)
+            {
+                // Account for all replaced arrays, not just the current live bitmap. Clamp
+                // geometric growth to the remaining budget in complete rows before allocating.
+                long affordableRows = (maximumGrowthBufferBytes - allocatedBufferBytes) / rowByteCount;
+                long newRowCount = Math.Min(Math.Max((long)rowCount + 1, 2L * rowCount), affordableRows);
+                if (newRowCount <= rowCount)
+                    throw new CorruptCompressedDataException("CCITT compact decode buffers exceed the allocation budget.");
+                int newByteCount = checked((int)(newRowCount * rowByteCount));
+                Array.Resize(ref decodedBitmap, newByteCount);
+                allocatedBufferBytes += newByteCount;
+                rowCount = (int)newRowCount;
+            }
+            var rowPixels = discardRow ? discardedRow.AsSpan() : decodedBitmap.AsSpan(rowIndex * rowByteCount, rowByteCount);
 #if NET8_0_OR_GREATER
             rowPixels.Fill(T.BlackIsOne ? (byte)0 : (byte)255);
 #else
@@ -353,12 +504,17 @@ internal static partial class CcittFaxCompactDecoder
             if (default(T).IsGroup4)
 #endif
             {
-                if (encodedByteAlign)
-                    bitReader.AlignToByteBoundary();
+                if (acceptOptionalEndOfLine)
+                {
+                    bool hasEol = bitReader.TryReadEndOfLine();
+                    if (requireEndOfLine && !hasEol)
+                        throw new InvalidDataException("Required CCITT EOL is missing.");
+                }
                 isOneDimensional = false;
             }
             else
-                isOneDimensional = bitReader.ReadRowIsOneDimensional<T>(compressionType, encodedByteAlign);
+                isOneDimensional = bitReader.ReadRowIsOneDimensional<T>(compressionType,
+                    false, acceptOptionalEndOfLine, requireEndOfLine);
             bool isWhiteRun = true;
             int pixelPosition = 0;
             int transitionCount = 0;
@@ -495,5 +651,29 @@ internal static partial class CcittFaxCompactDecoder
             (referenceTransitions, currentTransitions) = (currentTransitions, referenceTransitions);
             referenceTransitionCount = transitionCount;
         }
+        var status = CcittFaxDecodeStatus.RowLimit;
+        if (verifyEndMarker)
+        {
+            // A full bitmap does not prove the image ended: Height can be too small. Apply
+            // the same trailer rules as at an earlier row boundary. If none matches, fail
+            // this compact attempt so the growing path can decode further complete rows.
+            bool exactDeclaredRows = expectedRowsForEndTolerance > 0 && rowCount == expectedRowsForEndTolerance;
+            bool cleanEndOfInput = (allowEndOfInput && bitReader.HasOnlyBytePadding)
+                || allowEndTolerance && exactDeclaredRows && bitReader.TryReadZeroFillToEnd();
+            bool allowSingleEol = allowEndTolerance && exactDeclaredRows
+                && (!encodedByteAlign || bitReader.HasZeroAlignmentPadding);
+            if (encodedByteAlign)
+                bitReader.AlignToByteBoundary();
+            status = bitReader.ReadEndOfBlockStatus(compressionType,
+                allowIncompleteRtc: allowEndTolerance && rowCount > 0
+                    && (expectedRowsForEndTolerance == 0 || exactDeclaredRows),
+                allowIncompleteEofb: allowSingleEol, allowSingleGroup3Eol: allowSingleEol);
+            if (status == CcittFaxDecodeStatus.NotCompleted && cleanEndOfInput)
+                status = CcittFaxDecodeStatus.EndOfInput;
+            if (status == CcittFaxDecodeStatus.NotCompleted)
+                throw new InvalidDataException("CCITT end marker not found at the bitmap capacity hint.");
+        }
+        bitReader.AlignToByteBoundary();
+        return new CompactDecodeResult(rowIndex, status);
     }
 }
